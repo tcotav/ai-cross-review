@@ -26,6 +26,7 @@ Symlink, don't copy — this keeps the repo as the single source of truth,
 so `git pull` here updates everywhere it's linked.
 
 ```bash
+mkdir -p ~/bin ~/.claude/skills   # both commonly don't exist on a fresh machine
 ln -s "$(pwd)/cross-review.sh" ~/bin/cross-review.sh          # needs ~/bin on PATH
 ln -s "$(pwd)/skills/cross-review-brief" ~/.claude/skills/cross-review-brief
 ```
