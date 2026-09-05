@@ -78,6 +78,37 @@ output. Say which tool to review with (`codex`, `claude`, `agy`) and
 optionally `--model` if you want a specific one; if you don't say,
 ask which vendor before assuming.
 
+### Recommended order (and a pitfall to avoid)
+
+**Don't commit before reviewing.** `init` with no `--base` diffs against
+`HEAD` — if you've already committed your change, `HEAD` *is* that
+change, so `git diff HEAD` shows nothing and you get an empty review.
+Reviewing the uncommitted working tree is what works by default with
+no extra flags; if you do want to review something already committed,
+pass `--base <ref-before-it>` explicitly.
+
+This also happens to be close to optimal for token cost and scan
+radius:
+
+1. Finish one focused unit of work — don't batch unrelated changes
+   into one diff. Smaller diffs cost fewer reviewer tokens and are
+   easier for the reviewer to actually hold in its head at once.
+2. Ask for the brief right away, while the ask is still recent in
+   conversation — cheaper for whoever's writing `task.md` than
+   scanning back through a long session later.
+3. `init` + `review` against the *uncommitted* tree.
+4. Fix real findings directly rather than via headless `respond` — one
+   less tool invocation for something you can just do in-session.
+5. Re-review once to confirm. Every round resends the *entire*
+   `findings.md` ledger in the prompt, so cost scales with round count
+   on a given session, not just diff size — loop more only if you're
+   genuinely still finding things, not by default.
+6. Commit last, once the loop settles — one clean commit of reviewed
+   code instead of a raw commit plus fixups.
+7. Start a fresh session (`init`) for the next unit of work rather than
+   reusing this one — keeps each ledger small instead of letting it
+   accumulate across unrelated changes.
+
 ### Manual CLI
 
 Useful for scripting, CI, or when you're not in an interactive agent
