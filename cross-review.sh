@@ -56,6 +56,11 @@ stored_base() {
   [[ -f "$dir/base" ]] && cat "$dir/base" || true
 }
 
+stored_repo_root() {
+  local dir="$1"
+  [[ -f "$dir/repo-root" ]] && cat "$dir/repo-root" || true
+}
+
 # mkdir is atomic even on network filesystems, unlike flock (which isn't
 # available on macOS by default anyway) or a lock file written with `>`.
 # An EXIT trap (not RETURN — that fires on every function return, not
@@ -173,6 +178,14 @@ cmd_init() {
      better the findings. -->
 EOF
 
+  # Record the repo root so later review/respond calls operate there
+  # regardless of the caller's cwd when they invoke this — otherwise
+  # running `respond` from a different directory than `init` was run in
+  # could freeze diffs or (worse) let the author tool edit files against
+  # the wrong repo entirely while still correctly appending to this
+  # session's ledger.
+  git rev-parse --show-toplevel > "$dir/repo-root"
+
   # Always pin an immutable commit SHA, whether --base was given or not.
   # A supplied ref like a branch name (e.g. --base main) is just as
   # mutable as the implicit HEAD default: if main moves before a later
@@ -201,6 +214,7 @@ EOF
 
 cmd_review() {
   local dir="${1:?session dir required}"; shift
+  dir="$(cd "$dir" && pwd)"
   local tool=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -211,6 +225,15 @@ cmd_review() {
   [[ -n "$tool" ]] || { echo "--with codex|agy|claude is required" >&2; exit 1; }
 
   acquire_lock "$dir"
+
+  # Operate from the repo root recorded at init time, not wherever the
+  # caller happens to be now — otherwise running review/respond from a
+  # different cwd than init used could diff (or, worse, edit) the wrong
+  # repo while still appending to the right session's ledger. Falls back
+  # to the caller's cwd for sessions created before this was recorded.
+  local repo_root
+  repo_root="$(stored_repo_root "$dir")"
+  [[ -n "$repo_root" ]] && cd "$repo_root"
 
   freeze_diff "$dir" "$(stored_base "$dir")"
   local round
@@ -252,6 +275,7 @@ cmd_review() {
 
 cmd_respond() {
   local dir="${1:?session dir required}"; shift
+  dir="$(cd "$dir" && pwd)"
   local tool=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -263,6 +287,10 @@ cmd_respond() {
 
   acquire_lock "$dir"
 
+  local repo_root
+  repo_root="$(stored_repo_root "$dir")"
+  [[ -n "$repo_root" ]] && cd "$repo_root"
+
   freeze_diff "$dir" "$(stored_base "$dir")"
   local round
   round="$(next_round "$dir/findings.md")"
@@ -270,15 +298,12 @@ cmd_respond() {
   local prompt_file
   prompt_file="$(mktemp)"
 
-  local abs_dir
-  abs_dir="$(cd "$dir" && pwd)"
-
   {
     cat "$ROOT_DIR/prompts/respond.md"
     echo
     echo "## Session"
     echo "Working directory: $(pwd)"
-    echo "Findings ledger (append your Response blocks here): $abs_dir/findings.md"
+    echo "Findings ledger (append your Response blocks here): $dir/findings.md"
     echo
     echo "## Round number for this run: $round"
     echo
