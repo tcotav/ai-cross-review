@@ -230,14 +230,102 @@ cmd_respond() {
   echo "confirm it appended Response blocks before the next review round."
 }
 
+# Parses findings.md into one tab-separated row per finding:
+#   id \t final_status \t severity \t file \t summary
+# "final_status" is whichever Status: line occurs LAST inside that
+# finding's block, so a finding that started open and later got a
+# "### Response (author)" with Status: fixed is counted once, as fixed —
+# not once for each line (a naive grep -c per status double-counts these).
+parse_findings() {
+  local findings="$1"
+  awk '
+    function emit() {
+      if (fid != "") {
+        printf "%s\t%s\t%s\t%s\t%s\n", fid, status, severity, file, summary
+      }
+    }
+    /^## F[0-9]+/ {
+      emit()
+      line = $0
+      sub(/^## /, "", line)
+      # Use sub() to strip through the separator rather than substr()
+      # arithmetic — this awk counts string offsets in bytes, and the
+      # em dash is a multi-byte UTF-8 character, so a fixed "+3" landed
+      # mid-character and corrupted the first byte of the summary.
+      if (line ~ / — /) {
+        fid = line
+        sub(/ — .*/, "", fid)
+        summary = line
+        sub(/^F[0-9]+ — /, "", summary)
+      } else {
+        fid = line
+        summary = ""
+      }
+      status = ""
+      severity = ""
+      file = ""
+      next
+    }
+    fid != "" && /^Reviewer:/ {
+      n = split($0, kv, "|")
+      for (i = 1; i <= n; i++) {
+        gsub(/^[ \t]+|[ \t]+$/, "", kv[i])
+        if (kv[i] ~ /^Severity:/) { severity = kv[i]; sub(/^Severity: */, "", severity) }
+        if (kv[i] ~ /^Status:/)   { status = kv[i];   sub(/^Status: */, "", status) }
+      }
+      next
+    }
+    fid != "" && /^Status:/ {
+      n = split($0, kv, "|")
+      s = kv[1]
+      gsub(/^[ \t]+|[ \t]+$/, "", s)
+      sub(/^Status: */, "", s)
+      status = s
+      next
+    }
+    fid != "" && file == "" && /^File:/ {
+      file = $0
+      sub(/^File: */, "", file)
+      next
+    }
+    END { emit() }
+  ' "$findings"
+}
+
 cmd_status() {
   local dir="${1:?session dir required}"
-  local open fixed wontfix disputed
-  open="$(grep -c 'Status: open' "$dir/findings.md" 2>/dev/null || true)"
-  fixed="$(grep -c 'Status: fixed' "$dir/findings.md" 2>/dev/null || true)"
-  wontfix="$(grep -c 'Status: wontfix' "$dir/findings.md" 2>/dev/null || true)"
-  disputed="$(grep -c 'Status: disputed' "$dir/findings.md" 2>/dev/null || true)"
-  echo "open=$open fixed=$fixed wontfix=$wontfix disputed=$disputed"
+  local rows
+  rows="$(parse_findings "$dir/findings.md")"
+
+  if [[ -z "$rows" ]]; then
+    echo "No findings yet."
+    return
+  fi
+
+  local total open fixed wontfix disputed
+  total="$(echo "$rows" | wc -l | tr -d ' ')"
+  open="$(echo "$rows" | awk -F'\t' '$2=="open"' | wc -l | tr -d ' ')"
+  fixed="$(echo "$rows" | awk -F'\t' '$2=="fixed"' | wc -l | tr -d ' ')"
+  wontfix="$(echo "$rows" | awk -F'\t' '$2=="wontfix"' | wc -l | tr -d ' ')"
+  disputed="$(echo "$rows" | awk -F'\t' '$2=="disputed"' | wc -l | tr -d ' ')"
+
+  echo "$total findings — open=$open fixed=$fixed wontfix=$wontfix disputed=$disputed"
+
+  local open_rows
+  open_rows="$(echo "$rows" | awk -F'\t' '$2=="open"')"
+  if [[ -n "$open_rows" ]]; then
+    echo
+    echo "Open (awaiting author response):"
+    echo "$open_rows" | awk -F'\t' '{printf "  %s [%s] %s — %s\n", $1, $3, $5, $4}'
+  fi
+
+  local disputed_rows
+  disputed_rows="$(echo "$rows" | awk -F'\t' '$2=="disputed"')"
+  if [[ -n "$disputed_rows" ]]; then
+    echo
+    echo "Disputed (author pushed back, reviewer should re-check):"
+    echo "$disputed_rows" | awk -F'\t' '{printf "  %s [%s] %s — %s\n", $1, $3, $5, $4}'
+  fi
 }
 
 main() {
