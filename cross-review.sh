@@ -50,6 +50,11 @@ next_round() {
   echo "$((n + 1))"
 }
 
+stored_base() {
+  local dir="$1"
+  [[ -f "$dir/base" ]] && cat "$dir/base" || true
+}
+
 freeze_diff() {
   local dir="$1" base="${2:-}"
   if [[ -n "$base" ]]; then
@@ -87,12 +92,10 @@ run_tool() {
       agy -p "$(cat "$prompt_file")" --output-format text
       ;;
     claude)
-      # NOTE: invoking `claude -p` from *inside* an active Claude Code
-      # session hung indefinitely in testing (tried both stdin and
-      # positional-arg prompt forms, with and without --permission-mode).
-      # Likely session/auth lock contention between the parent and nested
-      # CLI process. Run the `claude` leg from a plain terminal, not from
-      # inside another Claude Code session, until this is root-caused.
+      # If this hangs for minutes with no output, it's almost certainly
+      # an invalid ANTHROPIC_API_KEY env var (claude -p retries 401s 11x
+      # with backoff before surfacing anything) — not this harness. See
+      # README "Status per tool".
       local perm="plan"
       [[ "$mode" == "author" ]] && perm="acceptEdits"
       claude -p --permission-mode "$perm" --output-format text < "$prompt_file"
@@ -114,7 +117,11 @@ cmd_init() {
     esac
   done
 
-  local dir="$SESSIONS_ROOT/$(date -u +%Y%m%d-%H%M)-${slug}"
+  local dir="$SESSIONS_ROOT/$(date -u +%Y%m%d-%H%M%S)-${slug}"
+  if [[ -e "$dir" ]]; then
+    echo "Session dir already exists, refusing to overwrite: $dir" >&2
+    exit 1
+  fi
   mkdir -p "$dir"
 
   cat > "$dir/task.md" <<'EOF'
@@ -123,7 +130,19 @@ cmd_init() {
      better the findings. -->
 EOF
 
-  freeze_diff "$dir" "$base"
+  # Always pin an immutable base, even when --base wasn't given: resolve
+  # to the current HEAD SHA. Storing the literal string "HEAD" (or
+  # leaving it empty) would mean every later freeze re-resolves against
+  # whatever HEAD is *then* — which goes empty the moment anything gets
+  # committed mid-review. Pinning the SHA now means later diffs correctly
+  # include everything since this session started, committed or not.
+  local resolved_base="$base"
+  if [[ -z "$resolved_base" ]]; then
+    resolved_base="$(git rev-parse HEAD)"
+  fi
+  echo "$resolved_base" > "$dir/base"
+
+  freeze_diff "$dir" "$resolved_base"
 
   cat > "$dir/findings.md" <<EOF
 # Findings — ${slug}
@@ -147,7 +166,7 @@ cmd_review() {
   done
   [[ -n "$tool" ]] || { echo "--with codex|agy|claude is required" >&2; exit 1; }
 
-  freeze_diff "$dir"
+  freeze_diff "$dir" "$(stored_base "$dir")"
   local round
   round="$(next_round "$dir/findings.md")"
 
@@ -196,7 +215,7 @@ cmd_respond() {
   done
   [[ -n "$tool" ]] || { echo "--with codex|agy|claude is required" >&2; exit 1; }
 
-  freeze_diff "$dir"
+  freeze_diff "$dir" "$(stored_base "$dir")"
   local round
   round="$(next_round "$dir/findings.md")"
 
