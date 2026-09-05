@@ -85,11 +85,14 @@ run_tool() {
       ;;
     agy)
       # Untested — no agy install available when this was written. Antigravity
-      # docs (antigravity.google/docs/cli/headless) show `agy -p "<prompt>"
-      # --output-format json`; adjust once you can verify against a real
-      # install, e.g. stdin support and a read-only/plan flag equivalent to
-      # codex's --sandbox read-only.
-      agy -p "$(cat "$prompt_file")" --output-format text
+      # docs (antigravity.google/docs/cli/headless) show plain `agy -p
+      # "<prompt>"` as already giving plain-text output on stdout, with
+      # `--output-format json` as an opt-in for structured output — so we
+      # deliberately don't pass --output-format at all here rather than
+      # guess at an unconfirmed "text" value. Adjust once you can verify
+      # against a real install, e.g. stdin support and a read-only/plan
+      # flag equivalent to codex's --sandbox read-only.
+      agy -p "$(cat "$prompt_file")"
       ;;
     claude)
       # If this hangs for minutes with no output, it's almost certainly
@@ -130,16 +133,19 @@ cmd_init() {
      better the findings. -->
 EOF
 
-  # Always pin an immutable base, even when --base wasn't given: resolve
-  # to the current HEAD SHA. Storing the literal string "HEAD" (or
-  # leaving it empty) would mean every later freeze re-resolves against
-  # whatever HEAD is *then* — which goes empty the moment anything gets
-  # committed mid-review. Pinning the SHA now means later diffs correctly
-  # include everything since this session started, committed or not.
-  local resolved_base="$base"
-  if [[ -z "$resolved_base" ]]; then
-    resolved_base="$(git rev-parse HEAD)"
-  fi
+  # Always pin an immutable commit SHA, whether --base was given or not.
+  # A supplied ref like a branch name (e.g. --base main) is just as
+  # mutable as the implicit HEAD default: if main moves before a later
+  # review, git diff "$base" silently changes the session's baseline.
+  # Resolving through ^{commit} up front means later freezes stay
+  # anchored to where the session actually started, either way.
+  # Plain rev-parse (not ^{commit}) so a valid non-commit base like the
+  # empty-tree hash (used for "diff the whole history" sessions) still
+  # resolves — it only needs to pass through unchanged, whereas ^{commit}
+  # peeling rejects it outright since it dereferences to a tree, not a
+  # commit.
+  local resolved_base="${base:-HEAD}"
+  resolved_base="$(git rev-parse "$resolved_base")"
   echo "$resolved_base" > "$dir/base"
 
   freeze_diff "$dir" "$resolved_base"
