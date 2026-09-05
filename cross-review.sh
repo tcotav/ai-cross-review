@@ -544,7 +544,11 @@ cmd_status() {
   token_summary="$(awk -F'tokens: ' '
     /^## Round / {
       v = $2
-      if (v == "unknown") { unknown++ } else { sum += v; known++ }
+      # v is empty (not "unknown") for rounds recorded before the
+      # tokens: field existed at all — those must not silently count as
+      # "known, contributed 0" or both the round count and the resulting
+      # average get quietly wrong.
+      if (v == "unknown" || v == "") { unknown++ } else { sum += v; known++ }
     }
     END { printf "%d\t%d\t%d", sum+0, known+0, unknown+0 }
   ' "$dir/findings.md")"
