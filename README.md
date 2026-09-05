@@ -189,3 +189,7 @@ Status: `open | fixed | wontfix | disputed`.
   session — read `findings.md` yourself and work the list.
 - No support yet for local/OSS model backends (Codex `--oss`, etc.) — add
   a case in `run_tool()` if you need it.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
