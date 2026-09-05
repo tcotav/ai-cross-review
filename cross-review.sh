@@ -270,8 +270,15 @@ cmd_respond() {
   local prompt_file
   prompt_file="$(mktemp)"
 
+  local abs_dir
+  abs_dir="$(cd "$dir" && pwd)"
+
   {
     cat "$ROOT_DIR/prompts/respond.md"
+    echo
+    echo "## Session"
+    echo "Working directory: $(pwd)"
+    echo "Findings ledger (append your Response blocks here): $abs_dir/findings.md"
     echo
     echo "## Round number for this run: $round"
     echo

@@ -13,7 +13,10 @@ For every finding whose `Status` is `open`:
    check your reasoning next round instead of re-arguing blind.
 
 Do not edit findings.md except to append your response blocks — never
-rewrite or delete a reviewer's original entry.
+rewrite or delete a reviewer's original entry. The "## Session" section
+below gives you the absolute path to the actual findings.md file to
+edit — the copy shown further down in this prompt is for your reading
+context only, appending to that text does nothing.
 
 ## Response format
 
