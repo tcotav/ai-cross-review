@@ -17,6 +17,22 @@ does not loop automatically — you decide when to run another round.
 - `git`
 - At least two of: `claude` (Claude Code), `codex` (Codex CLI), `agy`
   (Antigravity CLI), each authenticated and on `PATH`.
+- Optional: `skills/cross-review-brief` symlinked into `~/.claude/skills/`
+  (see Install) to have Claude Code write `task.md` for you.
+
+## Install
+
+Symlink, don't copy — this keeps the repo as the single source of truth,
+so `git pull` here updates everywhere it's linked.
+
+```bash
+ln -s "$(pwd)/cross-review.sh" ~/bin/cross-review.sh          # needs ~/bin on PATH
+ln -s "$(pwd)/skills/cross-review-brief" ~/.claude/skills/cross-review-brief
+```
+
+`cross-review.sh` resolves its own real location through the symlink (to
+find `prompts/`), so this works from any directory once `~/bin` is on
+`PATH`.
 
 ## Usage
 
@@ -25,7 +41,12 @@ does not loop automatically — you decide when to run another round.
 ./cross-review.sh init auth-rework
 # -> .cross-review/20260905-0900-auth-rework
 
-# 2. Fill in the task/spec.
+# 2. Fill in the task/spec — either by hand, or ask Claude Code to run the
+#    cross-review-brief skill, which extracts the original ask from the
+#    conversation instead of you (or it) writing a retrospective summary
+#    of the work. Works regardless of when you decided to cross-review —
+#    start, middle, or end of the task — since it's pulling a fixed fact
+#    (what was asked) rather than judging the outcome.
 $EDITOR .cross-review/20260905-0900-auth-rework/task.md
 
 # 3. Get a review from a different vendor than whoever wrote the code.
