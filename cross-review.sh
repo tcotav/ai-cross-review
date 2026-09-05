@@ -91,12 +91,32 @@ acquire_lock() {
 }
 
 freeze_diff() {
-  local dir="$1" base="${2:-}"
-  if [[ -n "$base" ]]; then
-    git diff "$base" > "$dir/diff.patch"
-  else
-    git diff HEAD > "$dir/diff.patch"
-  fi
+  local dir="$1" base="${2:-HEAD}"
+  local abs_dir
+  abs_dir="$(cd -P "$dir" && pwd -P)"
+  {
+    git diff "$base"
+    # git diff never includes untracked files (verified: a staged new
+    # file shows up fine, a genuinely untracked one is invisible), so a
+    # change consisting of brand-new files would otherwise vanish from
+    # review entirely. Synthesize an "added file" diff for each one
+    # against /dev/null instead. --no-index exits 1 whenever it finds a
+    # difference (which a new file always does), so guard it explicitly
+    # rather than let `set -e` treat that as this function failing.
+    #
+    # Exclude the session dir itself by resolved absolute path, not by
+    # name prefix — if the target repo doesn't gitignore .cross-review
+    # (or CROSS_REVIEW_HOME points elsewhere, or init ran from a
+    # subdirectory), the session's own task.md/base/diff.patch would
+    # otherwise show up as "untracked files" and get folded into their
+    # own diff, growing every round it's re-frozen.
+    git ls-files --others --exclude-standard -z | while IFS= read -r -d '' f; do
+      case "$(cd -P "$(dirname "$f")" && pwd -P)/$(basename "$f")" in
+        "$abs_dir"/*) continue ;;
+      esac
+      git diff --no-index -- /dev/null "$f" || true
+    done
+  } > "$dir/diff.patch"
 }
 
 # mode is "review" (must not write to the repo) or "author" (needs write
@@ -236,7 +256,7 @@ EOF
 
 cmd_review() {
   local dir="${1:?session dir required}"; shift
-  dir="$(cd "$dir" && pwd)"
+  dir="$(cd -P "$dir" && pwd -P)"
   local tool=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -255,7 +275,7 @@ cmd_review() {
   # to the caller's cwd for sessions created before this was recorded.
   local repo_root
   repo_root="$(stored_repo_root "$dir")"
-  [[ -n "$repo_root" ]] && cd "$repo_root"
+  [[ -n "$repo_root" ]] && cd -P "$repo_root"
 
   freeze_diff "$dir" "$(stored_base "$dir")"
   local round
@@ -301,7 +321,7 @@ cmd_review() {
 
 cmd_respond() {
   local dir="${1:?session dir required}"; shift
-  dir="$(cd "$dir" && pwd)"
+  dir="$(cd -P "$dir" && pwd -P)"
   local tool=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -315,7 +335,7 @@ cmd_respond() {
 
   local repo_root
   repo_root="$(stored_repo_root "$dir")"
-  [[ -n "$repo_root" ]] && cd "$repo_root"
+  [[ -n "$repo_root" ]] && cd -P "$repo_root"
 
   freeze_diff "$dir" "$(stored_base "$dir")"
   local round
