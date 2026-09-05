@@ -95,8 +95,14 @@ acquire_lock() {
 
 freeze_diff() {
   local dir="$1" base="${2:-HEAD}"
-  local abs_dir
+  local abs_dir abs_sessions_root
   abs_dir="$(cd -P "$dir" && pwd -P)"
+  # Derived from abs_dir (dirname of "<sessions_root>/<timestamp>-<slug>")
+  # rather than re-resolving $SESSIONS_ROOT from scratch — the latter is
+  # just a relative name and would be exposed to the same cwd-relative-to-
+  # where-init-ran ambiguity that the repo-root fix (F11) had to work
+  # around for the session dir itself.
+  abs_sessions_root="$(dirname "$abs_dir")"
   {
     git diff "$base"
     # git diff never includes untracked files (verified: a staged new
@@ -107,15 +113,15 @@ freeze_diff() {
     # difference (which a new file always does), so guard it explicitly
     # rather than let `set -e` treat that as this function failing.
     #
-    # Exclude the session dir itself by resolved absolute path, not by
-    # name prefix — if the target repo doesn't gitignore .cross-review
-    # (or CROSS_REVIEW_HOME points elsewhere, or init ran from a
-    # subdirectory), the session's own task.md/base/diff.patch would
-    # otherwise show up as "untracked files" and get folded into their
-    # own diff, growing every round it's re-frozen.
+    # Exclude the whole sessions root (not just this session's own dir)
+    # by resolved absolute path, not by name prefix — if the target repo
+    # doesn't gitignore .cross-review (or CROSS_REVIEW_HOME points
+    # elsewhere, or init ran from a subdirectory), other sessions' own
+    # task.md/base/diff.patch would otherwise show up as "untracked
+    # files" too and get folded into an unrelated review's diff.
     git ls-files --others --exclude-standard -z | while IFS= read -r -d '' f; do
       case "$(cd -P "$(dirname "$f")" && pwd -P)/$(basename "$f")" in
-        "$abs_dir"/*) continue ;;
+        "$abs_sessions_root"/*) continue ;;
       esac
       git diff --no-index -- /dev/null "$f" || true
     done
