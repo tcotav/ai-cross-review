@@ -64,52 +64,54 @@ stored_repo_root() {
   [[ -f "$dir/repo-root" ]] && cat "$dir/repo-root" || true
 }
 
-# mkdir is atomic even on network filesystems, unlike flock (which isn't
-# available on macOS by default anyway) or a lock file written with `>`.
-# An EXIT trap (not RETURN — that fires on every function return, not
-# just process exit) releases it however the script ends: success,
-# error under set -e, or signal. The trap calls a named function rather
-# than an interpolated string — session-dir is caller-controlled, and a
-# path containing a single quote could otherwise break out of the
-# trap's quoting and inject shell commands.
-CROSS_REVIEW_LOCKDIR=""
+# A lock *file* (not directory) created under `set -C` (noclobber): the
+# `>` redirect fails atomically if the file already exists, so creation
+# and writing the owner pid happen as a single indivisible operation —
+# no separate "create, then write pid" step, so no window where a lock
+# exists but its pid file doesn't (an earlier mkdir-then-write version
+# had exactly that gap). An EXIT trap (not RETURN — that fires on every
+# function return, not just process exit) releases it however the
+# script ends: success, error under set -e, or signal. The trap calls a
+# named function rather than an interpolated string — session-dir is
+# caller-controlled, and a path containing a single quote could
+# otherwise break out of the trap's quoting and inject shell commands.
+CROSS_REVIEW_LOCKFILE=""
 
 release_lock() {
-  # rm -rf, not rmdir: the lock dir contains a pid file (see acquire_lock),
-  # so it's never actually empty by the time this runs.
-  [[ -n "$CROSS_REVIEW_LOCKDIR" ]] && rm -rf -- "$CROSS_REVIEW_LOCKDIR" 2>/dev/null
+  [[ -n "$CROSS_REVIEW_LOCKFILE" ]] && rm -f -- "$CROSS_REVIEW_LOCKFILE" 2>/dev/null
   return 0
 }
 
 acquire_lock() {
   local dir="$1" waited=0
-  CROSS_REVIEW_LOCKDIR="$dir/.lock"
-  while ! mkdir -- "$CROSS_REVIEW_LOCKDIR" 2>/dev/null; do
+  CROSS_REVIEW_LOCKFILE="$dir/.lock"
+  while true; do
+    if ( set -C; echo "$$" > "$CROSS_REVIEW_LOCKFILE" ) 2>/dev/null; then
+      break
+    fi
     # A process killed with SIGKILL (or otherwise terminated abnormally)
-    # never runs its EXIT trap, leaving the lock dir behind forever with
-    # no owner left to release it. Detect that by recording the owning
-    # PID and checking whether it's still alive — if it isn't, this is a
-    # dead lock, not an active one, so reclaim it instead of waiting out
-    # (and eventually failing on) a lock nobody is going to release.
-    # Missing pid file (a live process between mkdir and writing it, a
-    # vanishingly small window) is treated as "can't tell, assume live"
-    # rather than reclaimed, matching F15's fail-safe direction: wrongly
-    # waiting is recoverable, wrongly reclaiming an active lock isn't.
+    # never runs its EXIT trap, leaving the lock file behind forever with
+    # no owner left to release it. Detect that by checking whether the
+    # recorded owner pid is still alive — if it isn't, this is a dead
+    # lock, not an active one, so reclaim it instead of waiting out (and
+    # eventually failing on) a lock nobody is going to release. A missing
+    # or empty pid file is treated as "can't tell, assume live" rather
+    # than reclaimed: wrongly waiting is recoverable, wrongly reclaiming
+    # an active lock isn't.
     local owner_pid
-    owner_pid="$(cat "$CROSS_REVIEW_LOCKDIR/pid" 2>/dev/null || true)"
+    owner_pid="$(cat "$CROSS_REVIEW_LOCKFILE" 2>/dev/null || true)"
     if [[ -n "$owner_pid" ]] && ! kill -0 "$owner_pid" 2>/dev/null; then
-      echo "Reclaiming lock at $CROSS_REVIEW_LOCKDIR: owner pid $owner_pid is no longer running" >&2
-      rm -rf -- "$CROSS_REVIEW_LOCKDIR" 2>/dev/null
+      echo "Reclaiming lock at $CROSS_REVIEW_LOCKFILE: owner pid $owner_pid is no longer running" >&2
+      rm -f -- "$CROSS_REVIEW_LOCKFILE" 2>/dev/null
       continue
     fi
     if (( waited >= 30 )); then
-      echo "Could not acquire lock on $dir after 30s (stale lock at $CROSS_REVIEW_LOCKDIR?)" >&2
+      echo "Could not acquire lock on $dir after 30s (stale lock at $CROSS_REVIEW_LOCKFILE?)" >&2
       exit 1
     fi
     sleep 1
     waited=$((waited + 1))
   done
-  echo "$$" > "$CROSS_REVIEW_LOCKDIR/pid"
   trap release_lock EXIT
 }
 
