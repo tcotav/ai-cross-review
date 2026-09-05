@@ -60,18 +60,29 @@ stored_base() {
 # available on macOS by default anyway) or a lock file written with `>`.
 # An EXIT trap (not RETURN — that fires on every function return, not
 # just process exit) releases it however the script ends: success,
-# error under set -e, or signal.
+# error under set -e, or signal. The trap calls a named function rather
+# than an interpolated string — session-dir is caller-controlled, and a
+# path containing a single quote could otherwise break out of the
+# trap's quoting and inject shell commands.
+CROSS_REVIEW_LOCKDIR=""
+
+release_lock() {
+  [[ -n "$CROSS_REVIEW_LOCKDIR" ]] && rmdir -- "$CROSS_REVIEW_LOCKDIR" 2>/dev/null
+  return 0
+}
+
 acquire_lock() {
-  local dir="$1" lockdir="$1/.lock" waited=0
-  while ! mkdir "$lockdir" 2>/dev/null; do
+  local dir="$1" waited=0
+  CROSS_REVIEW_LOCKDIR="$dir/.lock"
+  while ! mkdir -- "$CROSS_REVIEW_LOCKDIR" 2>/dev/null; do
     if (( waited >= 30 )); then
-      echo "Could not acquire lock on $dir after 30s (stale lock at $lockdir?)" >&2
+      echo "Could not acquire lock on $dir after 30s (stale lock at $CROSS_REVIEW_LOCKDIR?)" >&2
       exit 1
     fi
     sleep 1
     waited=$((waited + 1))
   done
-  trap "rmdir '$lockdir' 2>/dev/null || true" EXIT
+  trap release_lock EXIT
 }
 
 freeze_diff() {
@@ -145,11 +156,16 @@ cmd_init() {
   fi
 
   local dir="$SESSIONS_ROOT/$(date -u +%Y%m%d-%H%M%S)-${slug}"
-  if [[ -e "$dir" ]]; then
+  # mkdir -p on the shared parent is safe to race (idempotent, no data to
+  # lose there); mkdir on the exact leaf dir is the atomic check-and-create
+  # for the part that actually holds session data — a separate
+  # [[ -e "$dir" ]] check followed by a create is a TOCTOU race between
+  # concurrent init calls with the same timestamp+slug.
+  mkdir -p "$SESSIONS_ROOT"
+  if ! mkdir "$dir" 2>/dev/null; then
     echo "Session dir already exists, refusing to overwrite: $dir" >&2
     exit 1
   fi
-  mkdir -p "$dir"
 
   cat > "$dir/task.md" <<'EOF'
 <!-- Describe the goal/spec for this change. This is handed to every
