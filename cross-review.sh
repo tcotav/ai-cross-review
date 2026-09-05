@@ -100,9 +100,12 @@ freeze_diff() {
 }
 
 # mode is "review" (must not write to the repo) or "author" (needs write
-# access to actually fix things).
+# access to actually fix things). token_file, if given, gets the tool's
+# reported token usage for this call written to it ("unknown" if the
+# tool doesn't expose one) — kept out of stdout since stdout here becomes
+# the finding/response text itself.
 run_tool() {
-  local tool="$1" mode="$2" prompt_file="$3"
+  local tool="$1" mode="$2" prompt_file="$3" token_file="${4:-}"
   case "$tool" in
     codex)
       # Verified against real codex-cli 0.153.2: prompt piped via stdin
@@ -112,11 +115,21 @@ run_tool() {
       # full event transcript.
       local sandbox="read-only"
       [[ "$mode" == "author" ]] && sandbox="workspace-write"
-      local out
+      local out transcript
       out="$(mktemp)"
-      codex exec --sandbox "$sandbox" -o "$out" - < "$prompt_file" > /dev/null 2>&1
+      transcript="$(mktemp)"
+      codex exec --sandbox "$sandbox" -o "$out" - < "$prompt_file" > "$transcript" 2>&1
       cat "$out"
-      rm -f "$out"
+      if [[ -n "$token_file" ]]; then
+        # Human-readable transcript ends with a literal "tokens used"
+        # line followed by a comma-formatted number on the next line
+        # (verified against codex-cli 0.153.2's actual output) — no
+        # --json/structured field for this was in the CLI's help output,
+        # so this is a best-effort scrape that could break on a future
+        # codex-cli version, not a documented contract.
+        awk '/^tokens used$/{getline; gsub(/,/,""); print; found=1; exit} END{if (!found) print "unknown"}' "$transcript" > "$token_file"
+      fi
+      rm -f "$out" "$transcript"
       ;;
     agy)
       # Untested — no agy install available when this was written. Antigravity
@@ -128,15 +141,24 @@ run_tool() {
       # against a real install, e.g. stdin support and a read-only/plan
       # flag equivalent to codex's --sandbox read-only.
       agy -p "$(cat "$prompt_file")"
+      [[ -n "$token_file" ]] && echo "unknown" > "$token_file"
       ;;
     claude)
       # If this hangs for minutes with no output, it's almost certainly
       # an invalid ANTHROPIC_API_KEY env var (claude -p retries 401s 11x
       # with backoff before surfacing anything) — not this harness. See
       # README "Status per tool".
+      #
+      # Token tracking not implemented yet: --output-format json reports
+      # usage, but this wasn't verified in-session (this session's own
+      # process has a stale ANTHROPIC_API_KEY baked into its env from
+      # before the fix, so testing claude -p here would hit the same
+      # 401-retry hang documented above — needs verifying from a fresh
+      # terminal, same as the rest of the claude leg was).
       local perm="plan"
       [[ "$mode" == "author" ]] && perm="acceptEdits"
       claude -p --permission-mode "$perm" --output-format text < "$prompt_file"
+      [[ -n "$token_file" ]] && echo "unknown" > "$token_file"
       ;;
     *)
       echo "Unknown tool: $tool (expected codex|agy|claude)" >&2
@@ -259,13 +281,17 @@ cmd_review() {
     cat "$dir/findings.md"
   } > "$prompt_file"
 
+  local token_file
+  token_file="$(mktemp)"
   local output
-  output="$(run_tool "$tool" review "$prompt_file")"
-  rm -f "$prompt_file"
+  output="$(run_tool "$tool" review "$prompt_file" "$token_file")"
+  local tokens
+  tokens="$(cat "$token_file")"
+  rm -f "$prompt_file" "$token_file"
 
   {
     echo
-    echo "## Round $round — reviewer:$tool — $(date -u +%FT%TZ)"
+    echo "## Round $round — reviewer:$tool — $(date -u +%FT%TZ) — tokens: $tokens"
     echo
     echo "$output"
   } >> "$dir/findings.md"
@@ -322,9 +348,15 @@ cmd_respond() {
   # Note: this invokes the tool headlessly, but fixing code well usually
   # wants full interactive tool use. This exists for scripting convenience,
   # not as the recommended default.
-  run_tool "$tool" author "$prompt_file"
-  rm -f "$prompt_file"
+  local token_file
+  token_file="$(mktemp)"
+  run_tool "$tool" author "$prompt_file" "$token_file"
+  local tokens
+  tokens="$(cat "$token_file")"
+  rm -f "$prompt_file" "$token_file"
 
+  echo
+  echo "tokens: $tokens"
   echo "Ran $tool as author over $dir/findings.md — review its edits and"
   echo "confirm it appended Response blocks before the next review round."
 }
@@ -393,11 +425,36 @@ parse_findings() {
 
 cmd_status() {
   local dir="${1:?session dir required}"
+
+  # Round headers look like "## Round N — reviewer:tool — <ts> — tokens: V"
+  # (V is a digit count from run_tool, or "unknown" for tools/paths that
+  # don't report one yet — see run_tool's per-tool notes). Computed before
+  # the findings check below since a round can legitimately find nothing,
+  # and token usage shouldn't disappear from the report just because it
+  # didn't.
+  local token_summary
+  token_summary="$(awk -F'tokens: ' '
+    /^## Round / {
+      v = $2
+      if (v == "unknown") { unknown++ } else { sum += v; known++ }
+    }
+    END { printf "%d\t%d\t%d", sum+0, known+0, unknown+0 }
+  ' "$dir/findings.md")"
+  local tok_sum tok_known tok_unknown
+  IFS=$'\t' read -r tok_sum tok_known tok_unknown <<< "$token_summary"
+
   local rows
   rows="$(parse_findings "$dir/findings.md")"
 
   if [[ -z "$rows" ]]; then
     echo "No findings yet."
+    if (( tok_known + tok_unknown > 0 )); then
+      if (( tok_unknown > 0 )); then
+        echo "Tokens: $tok_sum across $tok_known round(s) ($tok_unknown round(s) unknown — tool doesn't report usage yet)"
+      else
+        echo "Tokens: $tok_sum across $tok_known round(s)"
+      fi
+    fi
     return
   fi
 
@@ -409,6 +466,14 @@ cmd_status() {
   disputed="$(echo "$rows" | awk -F'\t' '$2=="disputed"' | wc -l | tr -d ' ')"
 
   echo "$total findings — open=$open fixed=$fixed wontfix=$wontfix disputed=$disputed"
+
+  if (( tok_known + tok_unknown > 0 )); then
+    if (( tok_unknown > 0 )); then
+      echo "Tokens: $tok_sum across $tok_known round(s) ($tok_unknown round(s) unknown — tool doesn't report usage yet)"
+    else
+      echo "Tokens: $tok_sum across $tok_known round(s)"
+    fi
+  fi
 
   local open_rows
   open_rows="$(echo "$rows" | awk -F'\t' '$2=="open"')"
