@@ -12,6 +12,25 @@ different priors and different bug sensitivity.
 This is deliberately thin. It does not manage specs, plans, or tasks, and it
 does not loop automatically — you decide when to run another round.
 
+## Same vendor vs. cross-vendor
+
+Every reviewer invocation is a fresh, standalone process — `run_tool`
+never resumes or forks a prior session, and the prompt it's given is
+self-contained (`task.md` + `diff.patch` + `findings.md` only). So
+nothing stops you from reviewing with the *same* vendor or even the
+same model that wrote the code (`--with codex --model <name>`, see
+below), and it won't "remember" writing it — there's no shared session
+to pull context from.
+
+What it won't give you is protection from *correlated* blind spots.
+Fresh-process isolation defeats "I remember writing this, so it's
+fine" rationalization, but the same weights/training still tend to
+miss the same classes of bugs regardless of whether the process has
+memory of writing them. Cross-vendor review defends against both;
+same-vendor (even with a different model via `--model`) only defends
+against the first. Still better than a stateful self-review, just not
+equivalent.
+
 ## Requirements
 
 - `git`
@@ -64,6 +83,14 @@ $EDITOR .cross-review/20260905-0900-auth-rework/task.md
 # 6. Check where things stand.
 ./cross-review.sh status .cross-review/20260905-0900-auth-rework
 ```
+
+`review` and `respond` also take `--model <name>` to pin a specific
+model instead of the tool's default — e.g. `--with codex --model
+gpt-5.6-luna`. Useful for same-vendor review with a different model
+than whatever wrote the code; see "Same vendor vs. cross-vendor"
+below for why that's weaker than cross-vendor review but still worth
+having. An invalid model name fails loudly (exit 1, no round appended)
+rather than silently producing an empty review.
 
 `status` reports each finding's *final* status (a finding that started
 `open` and later got a `Status: fixed` response counts once, as fixed —

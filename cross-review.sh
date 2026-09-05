@@ -27,11 +27,14 @@ Usage:
       Start a session: .cross-review/<timestamp>-<slug>/
       Freezes the current diff and creates task.md + findings.md stubs.
 
-  cross-review.sh review <session-dir> --with codex|agy|claude
+  cross-review.sh review <session-dir> --with codex|agy|claude [--model <name>]
       Re-freeze the diff, run the named reviewer headlessly against
       task.md + diff.patch + findings.md, append its output as a new round.
+      --model pins a specific model instead of the tool's default — e.g.
+      to review with the same vendor but a different model than whatever
+      wrote the code.
 
-  cross-review.sh respond <session-dir> --with codex|agy|claude
+  cross-review.sh respond <session-dir> --with codex|agy|claude [--model <name>]
       Run the named tool as the author role against the open findings.
       Usually you'd do this yourself interactively instead.
 
@@ -123,9 +126,13 @@ freeze_diff() {
 # access to actually fix things). token_file, if given, gets the tool's
 # reported token usage for this call written to it ("unknown" if the
 # tool doesn't expose one) — kept out of stdout since stdout here becomes
-# the finding/response text itself.
+# the finding/response text itself. model, if given, pins which
+# underlying model the tool uses instead of its default — e.g. to have
+# the same vendor's CLI review with a different model than whatever
+# wrote the code (see README for why that's weaker than cross-vendor
+# review but still better than nothing).
 run_tool() {
-  local tool="$1" mode="$2" prompt_file="$3" token_file="${4:-}"
+  local tool="$1" mode="$2" prompt_file="$3" token_file="${4:-}" model="${5:-}"
   case "$tool" in
     codex)
       # Verified against real codex-cli 0.153.2: prompt piped via stdin
@@ -135,10 +142,28 @@ run_tool() {
       # full event transcript.
       local sandbox="read-only"
       [[ "$mode" == "author" ]] && sandbox="workspace-write"
-      local out transcript
+      local out transcript rc=0
       out="$(mktemp)"
       transcript="$(mktemp)"
-      codex exec --sandbox "$sandbox" -o "$out" - < "$prompt_file" > "$transcript" 2>&1
+      # Plain if/else rather than an args array: bash 3.2 (macOS's default
+      # /bin/bash, which this whole script targets) treats "${arr[@]}" on
+      # a declared-but-empty array as unbound under set -u.
+      if [[ -n "$model" ]]; then
+        codex exec --sandbox "$sandbox" -m "$model" -o "$out" - < "$prompt_file" > "$transcript" 2>&1 || rc=$?
+      else
+        codex exec --sandbox "$sandbox" -o "$out" - < "$prompt_file" > "$transcript" 2>&1 || rc=$?
+      fi
+      if (( rc != 0 )); then
+        # mktemp pre-creates $out as an empty file, so a failed codex exec
+        # (e.g. an invalid --model) still leaves a readable-but-empty file
+        # behind — `cat "$out"` would exit 0 with no output, silently
+        # turning a real failure into what looks like an empty-findings
+        # round instead of surfacing the error.
+        echo "codex exec failed (exit $rc):" >&2
+        cat "$transcript" >&2
+        rm -f "$out" "$transcript"
+        exit 1
+      fi
       cat "$out"
       if [[ -n "$token_file" ]]; then
         # Human-readable transcript ends with a literal "tokens used"
@@ -159,8 +184,14 @@ run_tool() {
       # deliberately don't pass --output-format at all here rather than
       # guess at an unconfirmed "text" value. Adjust once you can verify
       # against a real install, e.g. stdin support and a read-only/plan
-      # flag equivalent to codex's --sandbox read-only.
-      agy -p "$(cat "$prompt_file")"
+      # flag equivalent to codex's --sandbox read-only. --model support
+      # here (agy -p ... --model <name>) is per docs, unverified like
+      # the rest of this leg.
+      if [[ -n "$model" ]]; then
+        agy -p "$(cat "$prompt_file")" --model "$model"
+      else
+        agy -p "$(cat "$prompt_file")"
+      fi
       [[ -n "$token_file" ]] && echo "unknown" > "$token_file"
       ;;
     claude)
@@ -177,7 +208,11 @@ run_tool() {
       # terminal, same as the rest of the claude leg was).
       local perm="plan"
       [[ "$mode" == "author" ]] && perm="acceptEdits"
-      claude -p --permission-mode "$perm" --output-format text < "$prompt_file"
+      if [[ -n "$model" ]]; then
+        claude -p --permission-mode "$perm" --output-format text --model "$model" < "$prompt_file"
+      else
+        claude -p --permission-mode "$perm" --output-format text < "$prompt_file"
+      fi
       [[ -n "$token_file" ]] && echo "unknown" > "$token_file"
       ;;
     *)
@@ -257,10 +292,11 @@ EOF
 cmd_review() {
   local dir="${1:?session dir required}"; shift
   dir="$(cd -P "$dir" && pwd -P)"
-  local tool=""
+  local tool="" model=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --with) tool="$2"; shift 2 ;;
+      --model) model="$2"; shift 2 ;;
       *) echo "Unknown arg: $1" >&2; exit 1 ;;
     esac
   done
@@ -304,28 +340,29 @@ cmd_review() {
   local token_file
   token_file="$(mktemp)"
   local output
-  output="$(run_tool "$tool" review "$prompt_file" "$token_file")"
+  output="$(run_tool "$tool" review "$prompt_file" "$token_file" "$model")"
   local tokens
   tokens="$(cat "$token_file")"
   rm -f "$prompt_file" "$token_file"
 
   {
     echo
-    echo "## Round $round — reviewer:$tool — $(date -u +%FT%TZ) — tokens: $tokens"
+    echo "## Round $round — reviewer:$tool${model:+ ($model)} — $(date -u +%FT%TZ) — tokens: $tokens"
     echo
     echo "$output"
   } >> "$dir/findings.md"
 
-  echo "Appended round $round ($tool) to $dir/findings.md"
+  echo "Appended round $round ($tool${model:+ model:$model}) to $dir/findings.md"
 }
 
 cmd_respond() {
   local dir="${1:?session dir required}"; shift
   dir="$(cd -P "$dir" && pwd -P)"
-  local tool=""
+  local tool="" model=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --with) tool="$2"; shift 2 ;;
+      --model) model="$2"; shift 2 ;;
       *) echo "Unknown arg: $1" >&2; exit 1 ;;
     esac
   done
@@ -370,14 +407,14 @@ cmd_respond() {
   # not as the recommended default.
   local token_file
   token_file="$(mktemp)"
-  run_tool "$tool" author "$prompt_file" "$token_file"
+  run_tool "$tool" author "$prompt_file" "$token_file" "$model"
   local tokens
   tokens="$(cat "$token_file")"
   rm -f "$prompt_file" "$token_file"
 
   echo
   echo "tokens: $tokens"
-  echo "Ran $tool as author over $dir/findings.md — review its edits and"
+  echo "Ran $tool${model:+ (model:$model)} as author over $dir/findings.md — review its edits and"
   echo "confirm it appended Response blocks before the next review round."
 }
 
