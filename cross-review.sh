@@ -75,7 +75,9 @@ stored_repo_root() {
 CROSS_REVIEW_LOCKDIR=""
 
 release_lock() {
-  [[ -n "$CROSS_REVIEW_LOCKDIR" ]] && rmdir -- "$CROSS_REVIEW_LOCKDIR" 2>/dev/null
+  # rm -rf, not rmdir: the lock dir contains a pid file (see acquire_lock),
+  # so it's never actually empty by the time this runs.
+  [[ -n "$CROSS_REVIEW_LOCKDIR" ]] && rm -rf -- "$CROSS_REVIEW_LOCKDIR" 2>/dev/null
   return 0
 }
 
@@ -83,6 +85,23 @@ acquire_lock() {
   local dir="$1" waited=0
   CROSS_REVIEW_LOCKDIR="$dir/.lock"
   while ! mkdir -- "$CROSS_REVIEW_LOCKDIR" 2>/dev/null; do
+    # A process killed with SIGKILL (or otherwise terminated abnormally)
+    # never runs its EXIT trap, leaving the lock dir behind forever with
+    # no owner left to release it. Detect that by recording the owning
+    # PID and checking whether it's still alive — if it isn't, this is a
+    # dead lock, not an active one, so reclaim it instead of waiting out
+    # (and eventually failing on) a lock nobody is going to release.
+    # Missing pid file (a live process between mkdir and writing it, a
+    # vanishingly small window) is treated as "can't tell, assume live"
+    # rather than reclaimed, matching F15's fail-safe direction: wrongly
+    # waiting is recoverable, wrongly reclaiming an active lock isn't.
+    local owner_pid
+    owner_pid="$(cat "$CROSS_REVIEW_LOCKDIR/pid" 2>/dev/null || true)"
+    if [[ -n "$owner_pid" ]] && ! kill -0 "$owner_pid" 2>/dev/null; then
+      echo "Reclaiming lock at $CROSS_REVIEW_LOCKDIR: owner pid $owner_pid is no longer running" >&2
+      rm -rf -- "$CROSS_REVIEW_LOCKDIR" 2>/dev/null
+      continue
+    fi
     if (( waited >= 30 )); then
       echo "Could not acquire lock on $dir after 30s (stale lock at $CROSS_REVIEW_LOCKDIR?)" >&2
       exit 1
@@ -90,6 +109,7 @@ acquire_lock() {
     sleep 1
     waited=$((waited + 1))
   done
+  echo "$$" > "$CROSS_REVIEW_LOCKDIR/pid"
   trap release_lock EXIT
 }
 
