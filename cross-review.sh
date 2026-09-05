@@ -36,7 +36,8 @@ Usage:
       Usually you'd do this yourself interactively instead.
 
   cross-review.sh status <session-dir>
-      Print open/fixed/wontfix/disputed counts.
+      Print per-status counts (by each finding's final status, not raw
+      line matches) plus a listing of open and disputed findings.
 
 Env:
   CROSS_REVIEW_HOME   override the sessions root (default: .cross-review)
@@ -53,6 +54,24 @@ next_round() {
 stored_base() {
   local dir="$1"
   [[ -f "$dir/base" ]] && cat "$dir/base" || true
+}
+
+# mkdir is atomic even on network filesystems, unlike flock (which isn't
+# available on macOS by default anyway) or a lock file written with `>`.
+# An EXIT trap (not RETURN — that fires on every function return, not
+# just process exit) releases it however the script ends: success,
+# error under set -e, or signal.
+acquire_lock() {
+  local dir="$1" lockdir="$1/.lock" waited=0
+  while ! mkdir "$lockdir" 2>/dev/null; do
+    if (( waited >= 30 )); then
+      echo "Could not acquire lock on $dir after 30s (stale lock at $lockdir?)" >&2
+      exit 1
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+  trap "rmdir '$lockdir' 2>/dev/null || true" EXIT
 }
 
 freeze_diff() {
@@ -120,6 +139,11 @@ cmd_init() {
     esac
   done
 
+  if [[ "$slug" == *"/"* || "$slug" == *".."* || -z "$slug" ]]; then
+    echo "Invalid slug: must be non-empty and contain no '/' or '..'" >&2
+    exit 1
+  fi
+
   local dir="$SESSIONS_ROOT/$(date -u +%Y%m%d-%H%M%S)-${slug}"
   if [[ -e "$dir" ]]; then
     echo "Session dir already exists, refusing to overwrite: $dir" >&2
@@ -137,8 +161,6 @@ EOF
   # A supplied ref like a branch name (e.g. --base main) is just as
   # mutable as the implicit HEAD default: if main moves before a later
   # review, git diff "$base" silently changes the session's baseline.
-  # Resolving through ^{commit} up front means later freezes stay
-  # anchored to where the session actually started, either way.
   # Plain rev-parse (not ^{commit}) so a valid non-commit base like the
   # empty-tree hash (used for "diff the whole history" sessions) still
   # resolves — it only needs to pass through unchanged, whereas ^{commit}
@@ -171,6 +193,8 @@ cmd_review() {
     esac
   done
   [[ -n "$tool" ]] || { echo "--with codex|agy|claude is required" >&2; exit 1; }
+
+  acquire_lock "$dir"
 
   freeze_diff "$dir" "$(stored_base "$dir")"
   local round
@@ -220,6 +244,8 @@ cmd_respond() {
     esac
   done
   [[ -n "$tool" ]] || { echo "--with codex|agy|claude is required" >&2; exit 1; }
+
+  acquire_lock "$dir"
 
   freeze_diff "$dir" "$(stored_base "$dir")"
   local round
