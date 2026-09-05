@@ -85,14 +85,18 @@ Status: `open | fixed | wontfix | disputed`.
   the no-write guarantee is enforced by the tool, not just the prompt;
   `respond` mode switches to `--sandbox workspace-write`. Confirmed it
   correctly flags an injected SQL-injection bug end to end.
-- **`--with claude`** — untested successfully: invoking `claude -p` from
-  *inside* an already-running Claude Code session hung indefinitely (tried
-  both stdin and positional-arg prompt forms, with and without
-  `--permission-mode`), most likely session/auth lock contention between
-  the parent and nested CLI process. Run the `claude` leg from a plain
-  terminal, not from inside another Claude Code session, until this is
-  root-caused. `review` mode uses `--permission-mode plan` (read-only);
-  `respond` uses `acceptEdits`.
+- **`--with claude`** — verified. `claude -p "..." --output-format text`
+  returns in ~5s once auth is clean. `review` mode uses
+  `--permission-mode plan` (read-only); `respond` uses `acceptEdits`. If
+  it hangs for you, it's very likely not this harness: check
+  `env | grep -i anthropic` for a stale `ANTHROPIC_API_KEY` — an invalid
+  key makes `claude -p` retry 11x with exponential backoff before
+  surfacing anything, which looks exactly like a multi-minute hang. Debug
+  with `claude -p "..." --debug-file /tmp/claude-debug.log` and check the
+  log tail for `authentication_error` if it recurs. Note the bad key can
+  be inherited by a *parent* Claude Code process too — fixing your shell
+  rc file won't fix an already-running session that already loaded it;
+  restart the session.
 - **`--with agy`** — untested, no Antigravity install available when this
   was written. Wired up per the documented headless flags
   (`agy -p "<prompt>" --output-format text`); no read-only/plan-mode
