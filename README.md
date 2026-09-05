@@ -56,17 +56,40 @@ find `prompts/`), so this works from any directory once `~/bin` is on
 
 ## Usage
 
+There are two ways to drive this. Talking to Claude Code (or whatever
+agent you're already working with) is the more common path in
+practice — the CLI is what's actually running underneath, but you
+rarely need to type it yourself.
+
+### Via Claude Code (typical)
+
+Just ask, once you've got a change you want a second opinion on:
+
+> brief this for cross-review and get a codex review
+
+Claude Code runs the `cross-review-brief` skill to write `task.md` from
+what you actually asked for earlier in the conversation (not a
+self-graded summary of the work — see the skill for why that
+distinction matters), then drives `init` → `review` → reading
+`findings.md` itself via the CLI commands below. It'll typically fix
+real findings directly in the same session and loop `review` again to
+confirm, reporting back a summary rather than you watching raw command
+output. Say which tool to review with (`codex`, `claude`, `agy`) and
+optionally `--model` if you want a specific one; if you don't say,
+ask which vendor before assuming.
+
+### Manual CLI
+
+Useful for scripting, CI, or when you're not in an interactive agent
+session at all.
+
 ```bash
 # 1. Start a session — freezes the current diff against HEAD.
 ./cross-review.sh init auth-rework
 # -> .cross-review/20260905-0900-auth-rework
 
-# 2. Fill in the task/spec — either by hand, or ask Claude Code to run the
-#    cross-review-brief skill, which extracts the original ask from the
-#    conversation instead of you (or it) writing a retrospective summary
-#    of the work. Works regardless of when you decided to cross-review —
-#    start, middle, or end of the task — since it's pulling a fixed fact
-#    (what was asked) rather than judging the outcome.
+# 2. Fill in the task/spec by hand (or use the skill above, even from a
+#    manual flow — it just needs a Claude Code session to run in).
 $EDITOR .cross-review/20260905-0900-auth-rework/task.md
 
 # 3. Get a review from a different vendor than whoever wrote the code.
