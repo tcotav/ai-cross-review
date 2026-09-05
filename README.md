@@ -79,6 +79,21 @@ Disputed (author pushed back, reviewer should re-check):
   F3 [major] Off-by-one in pagination — src/api.py:55
 ```
 
+`status` also sums token usage recorded in each round header (`## Round
+N — reviewer:tool — <ts> — tokens: V`):
+
+```
+Tokens: 4672 across 2 round(s)
+```
+
+Currently only `codex` reports a real number (scraped from its
+transcript — no `--json` field for this exists in `codex exec --help`,
+so treat it as best-effort, not a guarantee across versions); `claude`
+and `agy` report `unknown` until someone verifies their usage-reporting
+path. `respond`'s token cost isn't summed into `status` — there's no
+per-round ledger slot for it since the author tool writes its own
+Response block content, not this script — but it prints at call time.
+
 ## The ledger
 
 `findings.md` is the only shared state. Reviewers append `## F<n>` entries
