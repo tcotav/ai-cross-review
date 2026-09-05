@@ -83,12 +83,23 @@ release_lock() {
 }
 
 acquire_lock() {
-  local dir="$1" waited=0
+  local dir="$1" waited=0 tmp_pid
   CROSS_REVIEW_LOCKFILE="$dir/.lock"
   while true; do
-    if ( set -C; echo "$$" > "$CROSS_REVIEW_LOCKFILE" ) 2>/dev/null; then
+    # `ln` fails with EEXIST if the target already exists (unlike mv/
+    # rename, which would silently replace it) — write the pid to a
+    # uniquely-named temp file first, fully, then publish it under the
+    # shared lock name with one atomic ln. Unlike `set -C > file` (the
+    # prior approach), there's no window where the file is visible under
+    # its final name before its content exists, since the content is
+    # already complete before the name is ever shared.
+    tmp_pid="$(mktemp "$dir/.lock.XXXXXX")"
+    echo "$$" > "$tmp_pid"
+    if ln "$tmp_pid" "$CROSS_REVIEW_LOCKFILE" 2>/dev/null; then
+      rm -f "$tmp_pid"
       break
     fi
+    rm -f "$tmp_pid"
     # A process killed with SIGKILL (or otherwise terminated abnormally)
     # never runs its EXIT trap, leaving the lock file behind forever with
     # no owner left to release it. Detect that by checking whether the
@@ -125,6 +136,18 @@ freeze_diff() {
   # where-init-ran ambiguity that the repo-root fix (F11) had to work
   # around for the session dir itself.
   abs_sessions_root="$(dirname "$abs_dir")"
+  # A sessions root that resolves to the repo root itself would make the
+  # exclusion below (rightly) skip "everything under the sessions root"
+  # and (wrongly) skip every untracked file in the whole repo, silently
+  # undoing the untracked-files fix entirely. There's no legitimate
+  # reason to point CROSS_REVIEW_HOME at the repo root, so refuse rather
+  # than degrade quietly.
+  local repo_top
+  repo_top="$(git rev-parse --show-toplevel)"
+  if [[ "$abs_sessions_root" == "$repo_top" ]]; then
+    echo "Sessions root ($abs_sessions_root) is the repository root — refusing, this would hide every untracked file in the repo from review, not just session scratch files. Point CROSS_REVIEW_HOME at a subdirectory instead." >&2
+    exit 1
+  fi
   {
     git diff "$base"
     # git diff never includes untracked files (verified: a staged new
