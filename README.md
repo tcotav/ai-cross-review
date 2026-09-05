@@ -64,6 +64,21 @@ $EDITOR .cross-review/20260905-0900-auth-rework/task.md
 ./cross-review.sh status .cross-review/20260905-0900-auth-rework
 ```
 
+`status` reports each finding's *final* status (a finding that started
+`open` and later got a `Status: fixed` response counts once, as fixed —
+not once per line), plus a listing of anything still open or disputed:
+
+```
+5 findings — open=2 fixed=1 wontfix=1 disputed=1
+
+Open (awaiting author response):
+  F4 [major] Unhandled exception on empty input — src/api.py:80
+  F5 [critical] Race condition in cache write — src/cache.py:22
+
+Disputed (author pushed back, reviewer should re-check):
+  F3 [major] Off-by-one in pagination — src/api.py:55
+```
+
 ## The ledger
 
 `findings.md` is the only shared state. Reviewers append `## F<n>` entries
