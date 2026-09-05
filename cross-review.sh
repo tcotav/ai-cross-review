@@ -9,7 +9,15 @@
 # you want to script that too.
 set -euo pipefail
 
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Resolve through symlinks (e.g. ~/bin/cross-review.sh -> this repo) so
+# prompts/ is always found relative to the real script, not the link.
+SOURCE="${BASH_SOURCE[0]}"
+while [[ -h "$SOURCE" ]]; do
+  DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+  SOURCE="$(readlink "$SOURCE")"
+  [[ "$SOURCE" != /* ]] && SOURCE="$DIR/$SOURCE"
+done
+ROOT_DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
 SESSIONS_ROOT="${CROSS_REVIEW_HOME:-.cross-review}"
 
 usage() {
