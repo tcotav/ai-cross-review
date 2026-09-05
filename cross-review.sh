@@ -1,0 +1,247 @@
+#!/usr/bin/env bash
+# Minimal cross-vendor code review harness.
+#
+# Ledger-based: findings.md is the single shared artifact reviewers and the
+# author read/append to. This script only automates the mechanical parts —
+# freezing the diff, invoking a reviewer CLI headlessly, and appending its
+# output under a round header. The author ("respond") step is usually better
+# run interactively in your normal session; `respond` here exists for when
+# you want to script that too.
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SESSIONS_ROOT="${CROSS_REVIEW_HOME:-.cross-review}"
+
+usage() {
+  cat <<'EOF'
+Usage:
+  cross-review.sh init <slug> [--base <git-ref>]
+      Start a session: .cross-review/<timestamp>-<slug>/
+      Freezes the current diff and creates task.md + findings.md stubs.
+
+  cross-review.sh review <session-dir> --with codex|agy|claude
+      Re-freeze the diff, run the named reviewer headlessly against
+      task.md + diff.patch + findings.md, append its output as a new round.
+
+  cross-review.sh respond <session-dir> --with codex|agy|claude
+      Run the named tool as the author role against the open findings.
+      Usually you'd do this yourself interactively instead.
+
+  cross-review.sh status <session-dir>
+      Print open/fixed/wontfix/disputed counts.
+
+Env:
+  CROSS_REVIEW_HOME   override the sessions root (default: .cross-review)
+EOF
+}
+
+next_round() {
+  local findings="$1"
+  local n
+  n="$(grep -c '^## Round ' "$findings" 2>/dev/null || true)"
+  echo "$((n + 1))"
+}
+
+freeze_diff() {
+  local dir="$1" base="${2:-}"
+  if [[ -n "$base" ]]; then
+    git diff "$base" > "$dir/diff.patch"
+  else
+    git diff HEAD > "$dir/diff.patch"
+  fi
+}
+
+# mode is "review" (must not write to the repo) or "author" (needs write
+# access to actually fix things).
+run_tool() {
+  local tool="$1" mode="$2" prompt_file="$3"
+  case "$tool" in
+    codex)
+      # Verified against real codex-cli 0.153.2: prompt piped via stdin
+      # (avoids ARG_MAX issues with large diffs), sandbox enforces the
+      # read-only guarantee at the tool level instead of relying on the
+      # prompt alone, -o gives us just the final message instead of the
+      # full event transcript.
+      local sandbox="read-only"
+      [[ "$mode" == "author" ]] && sandbox="workspace-write"
+      local out
+      out="$(mktemp)"
+      codex exec --sandbox "$sandbox" -o "$out" - < "$prompt_file" > /dev/null 2>&1
+      cat "$out"
+      rm -f "$out"
+      ;;
+    agy)
+      # Untested — no agy install available when this was written. Antigravity
+      # docs (antigravity.google/docs/cli/headless) show `agy -p "<prompt>"
+      # --output-format json`; adjust once you can verify against a real
+      # install, e.g. stdin support and a read-only/plan flag equivalent to
+      # codex's --sandbox read-only.
+      agy -p "$(cat "$prompt_file")" --output-format text
+      ;;
+    claude)
+      # NOTE: invoking `claude -p` from *inside* an active Claude Code
+      # session hung indefinitely in testing (tried both stdin and
+      # positional-arg prompt forms, with and without --permission-mode).
+      # Likely session/auth lock contention between the parent and nested
+      # CLI process. Run the `claude` leg from a plain terminal, not from
+      # inside another Claude Code session, until this is root-caused.
+      local perm="plan"
+      [[ "$mode" == "author" ]] && perm="acceptEdits"
+      claude -p --permission-mode "$perm" --output-format text < "$prompt_file"
+      ;;
+    *)
+      echo "Unknown tool: $tool (expected codex|agy|claude)" >&2
+      exit 1
+      ;;
+  esac
+}
+
+cmd_init() {
+  local slug="" base=""
+  slug="${1:?slug required}"; shift || true
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --base) base="$2"; shift 2 ;;
+      *) echo "Unknown arg: $1" >&2; exit 1 ;;
+    esac
+  done
+
+  local dir="$SESSIONS_ROOT/$(date -u +%Y%m%d-%H%M)-${slug}"
+  mkdir -p "$dir"
+
+  cat > "$dir/task.md" <<'EOF'
+<!-- Describe the goal/spec for this change. This is handed to every
+     reviewer and to the author role verbatim — the more concrete, the
+     better the findings. -->
+EOF
+
+  freeze_diff "$dir" "$base"
+
+  cat > "$dir/findings.md" <<EOF
+# Findings — ${slug}
+
+<!-- Reviewers append "## F<n>" entries below under a "## Round N" header.
+     The author appends "### Response (author)" blocks under each finding.
+     Don't hand-edit someone else's entry — append, don't rewrite. -->
+EOF
+
+  echo "$dir"
+}
+
+cmd_review() {
+  local dir="${1:?session dir required}"; shift
+  local tool=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --with) tool="$2"; shift 2 ;;
+      *) echo "Unknown arg: $1" >&2; exit 1 ;;
+    esac
+  done
+  [[ -n "$tool" ]] || { echo "--with codex|agy|claude is required" >&2; exit 1; }
+
+  freeze_diff "$dir"
+  local round
+  round="$(next_round "$dir/findings.md")"
+
+  local prompt_file
+  prompt_file="$(mktemp)"
+
+  {
+    cat "$ROOT_DIR/prompts/review.md"
+    echo
+    echo "## Round number for this run: $round"
+    echo
+    echo "## Task"
+    cat "$dir/task.md"
+    echo
+    echo "## Diff under review"
+    echo '```diff'
+    cat "$dir/diff.patch"
+    echo '```'
+    echo
+    echo "## Findings so far"
+    cat "$dir/findings.md"
+  } > "$prompt_file"
+
+  local output
+  output="$(run_tool "$tool" review "$prompt_file")"
+  rm -f "$prompt_file"
+
+  {
+    echo
+    echo "## Round $round — reviewer:$tool — $(date -u +%FT%TZ)"
+    echo
+    echo "$output"
+  } >> "$dir/findings.md"
+
+  echo "Appended round $round ($tool) to $dir/findings.md"
+}
+
+cmd_respond() {
+  local dir="${1:?session dir required}"; shift
+  local tool=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --with) tool="$2"; shift 2 ;;
+      *) echo "Unknown arg: $1" >&2; exit 1 ;;
+    esac
+  done
+  [[ -n "$tool" ]] || { echo "--with codex|agy|claude is required" >&2; exit 1; }
+
+  freeze_diff "$dir"
+  local round
+  round="$(next_round "$dir/findings.md")"
+
+  local prompt_file
+  prompt_file="$(mktemp)"
+
+  {
+    cat "$ROOT_DIR/prompts/respond.md"
+    echo
+    echo "## Round number for this run: $round"
+    echo
+    echo "## Task"
+    cat "$dir/task.md"
+    echo
+    echo "## Diff under review"
+    echo '```diff'
+    cat "$dir/diff.patch"
+    echo '```'
+    echo
+    echo "## Findings so far"
+    cat "$dir/findings.md"
+  } > "$prompt_file"
+
+  # Note: this invokes the tool headlessly, but fixing code well usually
+  # wants full interactive tool use. This exists for scripting convenience,
+  # not as the recommended default.
+  run_tool "$tool" author "$prompt_file"
+  rm -f "$prompt_file"
+
+  echo "Ran $tool as author over $dir/findings.md — review its edits and"
+  echo "confirm it appended Response blocks before the next review round."
+}
+
+cmd_status() {
+  local dir="${1:?session dir required}"
+  local open fixed wontfix disputed
+  open="$(grep -c 'Status: open' "$dir/findings.md" 2>/dev/null || true)"
+  fixed="$(grep -c 'Status: fixed' "$dir/findings.md" 2>/dev/null || true)"
+  wontfix="$(grep -c 'Status: wontfix' "$dir/findings.md" 2>/dev/null || true)"
+  disputed="$(grep -c 'Status: disputed' "$dir/findings.md" 2>/dev/null || true)"
+  echo "open=$open fixed=$fixed wontfix=$wontfix disputed=$disputed"
+}
+
+main() {
+  local cmd="${1:-}"; shift || true
+  case "$cmd" in
+    init) cmd_init "$@" ;;
+    review) cmd_review "$@" ;;
+    respond) cmd_respond "$@" ;;
+    status) cmd_status "$@" ;;
+    -h|--help|"") usage ;;
+    *) echo "Unknown command: $cmd" >&2; usage; exit 1 ;;
+  esac
+}
+
+main "$@"
