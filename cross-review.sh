@@ -19,6 +19,20 @@ while [[ -h "$SOURCE" ]]; do
 done
 ROOT_DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
 SESSIONS_ROOT="${CROSS_REVIEW_HOME:-.cross-review}"
+# A single file's diff bigger than this (bytes) gets replaced with a one-line stub instead of
+# its real content when freezing. Real-world trigger: a minified/single-line JSON fixture
+# (~4MB before, ~4MB after) produced an ~8.8MB diff for that one file alone, tripping
+# codex-cli 0.153.4's ~1,048,576-character input cap with a low-level RPC error that gave no
+# hint which file caused it. A whole file rendered as one changed line has no diffable
+# structure a reviewer could use anyway, so capping loses no real review value. Override for a
+# one-off larger cap (e.g. a big-but-genuinely-reviewable generated file).
+CROSS_REVIEW_MAX_FILE_DIFF_BYTES="${CROSS_REVIEW_MAX_FILE_DIFF_BYTES:-200000}"
+# Secondary, whole-diff safety net for the case where many moderately-sized files add up past a
+# reviewer CLI's input cap even though no single file trips the per-file cap above. Non-fatal
+# (a warning, not exit 1) -- this can't know any given tool's actual limit (they differ and
+# change), so it errs toward letting a legitimately large diff through with a heads-up rather
+# than blocking one that would have worked.
+CROSS_REVIEW_MAX_TOTAL_DIFF_BYTES="${CROSS_REVIEW_MAX_TOTAL_DIFF_BYTES:-800000}"
 
 usage() {
   cat <<'EOF'
@@ -126,6 +140,24 @@ acquire_lock() {
   trap release_lock EXIT
 }
 
+# Writes $tmp's content to stdout verbatim, unless it exceeds
+# CROSS_REVIEW_MAX_FILE_DIFF_BYTES, in which case a one-line stub (still opening with a real
+# `diff --git` header, so it reads like the real thing was just elided, not like the file was
+# silently dropped) replaces it. Takes a temp-file path rather than a diff string in a bash
+# variable — a multi-megabyte value doesn't need to round-trip through bash's own string
+# handling just to be measured and conditionally emitted.
+emit_file_diff() {
+  local tmp="$1" path="$2" bytes lines
+  bytes="$(wc -c < "$tmp" | tr -d ' ')"
+  if (( bytes > CROSS_REVIEW_MAX_FILE_DIFF_BYTES )); then
+    lines="$(wc -l < "$tmp" | tr -d ' ')"
+    echo "diff --git a/$path b/$path"
+    echo "@@ cross-review: diff omitted -- ${bytes} bytes / ${lines} lines, over the ${CROSS_REVIEW_MAX_FILE_DIFF_BYTES}-byte per-file cap (set CROSS_REVIEW_MAX_FILE_DIFF_BYTES to raise it). Large data fixtures / minified blobs have no reviewable line structure anyway -- inspect this file directly if its content matters here. @@"
+  else
+    cat "$tmp"
+  fi
+}
+
 freeze_diff() {
   local dir="$1" base="${2:-HEAD}"
   local abs_dir abs_sessions_root
@@ -149,7 +181,16 @@ freeze_diff() {
     exit 1
   fi
   {
-    git diff "$base"
+    # One file at a time (not a single whole-tree `git diff "$base"`), so emit_file_diff can cap
+    # each file independently — an oversized file no longer takes the rest of a perfectly
+    # reviewable diff down with it (see emit_file_diff's own header for the real-world trigger).
+    local f tmp
+    git diff --name-only "$base" -z | while IFS= read -r -d '' f; do
+      tmp="$(mktemp)"
+      git diff "$base" -- "$f" > "$tmp"
+      emit_file_diff "$tmp" "$f"
+      rm -f "$tmp"
+    done
     # git diff never includes untracked files (verified: a staged new
     # file shows up fine, a genuinely untracked one is invisible), so a
     # change consisting of brand-new files would otherwise vanish from
@@ -168,9 +209,19 @@ freeze_diff() {
       case "$(cd -P "$(dirname "$f")" && pwd -P)/$(basename "$f")" in
         "$abs_sessions_root"/*) continue ;;
       esac
-      git diff --no-index -- /dev/null "$f" || true
+      tmp="$(mktemp)"
+      git diff --no-index -- /dev/null "$f" > "$tmp" || true
+      emit_file_diff "$tmp" "$f"
+      rm -f "$tmp"
     done
   } > "$dir/diff.patch"
+  # Whole-diff safety net, after per-file capping above -- see
+  # CROSS_REVIEW_MAX_TOTAL_DIFF_BYTES's own comment on why this warns instead of failing.
+  local total_bytes
+  total_bytes="$(wc -c < "$dir/diff.patch" | tr -d ' ')"
+  if (( total_bytes > CROSS_REVIEW_MAX_TOTAL_DIFF_BYTES )); then
+    echo "Warning: $dir/diff.patch is ${total_bytes} bytes, over the ${CROSS_REVIEW_MAX_TOTAL_DIFF_BYTES}-byte total-diff threshold (CROSS_REVIEW_MAX_TOTAL_DIFF_BYTES) even after per-file capping (CROSS_REVIEW_MAX_FILE_DIFF_BYTES=${CROSS_REVIEW_MAX_FILE_DIFF_BYTES}). A reviewer CLI's own input cap may still reject this -- consider a lower CROSS_REVIEW_MAX_FILE_DIFF_BYTES or splitting this into more than one review session." >&2
+  fi
 }
 
 # mode is "review" (must not write to the repo) or "author" (needs write
