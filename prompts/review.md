@@ -31,6 +31,9 @@ fixed that aren't. If it's still broken, open a new entry and note
 - Missing tests, unless the task explicitly calls for them
 - Refactors or style preferences outside the scope of the diff
 - Pre-existing issues the diff didn't touch
+- Documentation-only staleness, if the task's deferred section says docs are
+  handled in a later pass. Still flag any runtime output (tool responses,
+  field descriptions) that contradicts actual behavior.
 
 ## Output format
 
