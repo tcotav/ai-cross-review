@@ -55,8 +55,9 @@ $EDITOR .cross-review/*-auth-rework/task.md # describe the goal/spec
 ```
 
 `review`/`respond` also take `--model <name>` to pin a specific model —
-see "Same vendor vs. cross-vendor" below. An invalid model name fails
-loudly (exit 1) rather than silently producing an empty review.
+see "Same vendor vs. cross-vendor" below. An invalid model name or a
+failed reviewer call fails loudly (exit 1) rather than silently
+producing an empty review.
 
 ## Same vendor vs. cross-vendor
 
@@ -76,6 +77,7 @@ stateful self-review, just not equivalent.
 - `git`
 - At least two of: `claude` (Claude Code), `codex` (Codex CLI), `agy`
   (Antigravity CLI), each authenticated and on `PATH`.
+- `jq`, if using `agy`.
 
 ## Install
 
@@ -135,8 +137,20 @@ Open (awaiting author response):
   clean. If `claude -p` hangs for minutes, it's almost always a stale
   `ANTHROPIC_API_KEY` env var (invalid keys retry silently before
   erroring) — not this harness. Token usage not yet implemented.
-- **`agy`** — untested, no Antigravity install available when this was
-  written. Wired up per documented flags; verify before trusting it.
+- **`agy`** — verified against agy 1.3.0, review only. Headless `agy -p`
+  auto-denies every tool call (commands, file reads, writes), so the
+  reviewer works purely from the inline prompt — that auto-deny is also
+  the no-write guarantee, unless your agy `settings.json` adds
+  `permissions.allow` rules. `respond --with agy` is refused for the same
+  reason. Token usage works. If `agy -p` fails with "Eligibility check
+  failed" on a work account, set `gcp.project` (and `gcp.location`) in
+  `~/.gemini/antigravity-cli/settings.json` so it uses the enterprise
+  license instead of the consumer one. Per-review timeout is
+  `CROSS_REVIEW_AGY_TIMEOUT` (default `900s`); a timeout fails the round
+  rather than recording agy's partial output. agy has no stdin input, so
+  the whole prompt goes in as one argument — bounded by `ARG_MAX` (about
+  1MB on macOS) and growing with the ledger each round; past that the
+  review fails loudly.
 
 ## License
 

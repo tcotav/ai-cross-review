@@ -48,16 +48,18 @@ Usage:
       to review with the same vendor but a different model than whatever
       wrote the code.
 
-  cross-review.sh respond <session-dir> --with codex|agy|claude [--model <name>]
+  cross-review.sh respond <session-dir> --with codex|claude [--model <name>]
       Run the named tool as the author role against the open findings.
-      Usually you'd do this yourself interactively instead.
+      Usually you'd do this yourself interactively instead. Not supported
+      for agy: its headless mode auto-denies file writes.
 
   cross-review.sh status <session-dir>
       Print per-status counts (by each finding's final status, not raw
       line matches) plus a listing of open and disputed findings.
 
 Env:
-  CROSS_REVIEW_HOME   override the sessions root (default: .cross-review)
+  CROSS_REVIEW_HOME         override the sessions root (default: .cross-review)
+  CROSS_REVIEW_AGY_TIMEOUT  agy --print-timeout per review (default: 900s)
 EOF
 }
 
@@ -279,22 +281,81 @@ run_tool() {
       rm -f "$out" "$transcript"
       ;;
     agy)
-      # Untested — no agy install available when this was written. Antigravity
-      # docs (antigravity.google/docs/cli/headless) show plain `agy -p
-      # "<prompt>"` as already giving plain-text output on stdout, with
-      # `--output-format json` as an opt-in for structured output — so we
-      # deliberately don't pass --output-format at all here rather than
-      # guess at an unconfirmed "text" value. Adjust once you can verify
-      # against a real install, e.g. stdin support and a read-only/plan
-      # flag equivalent to codex's --sandbox read-only. --model support
-      # here (agy -p ... --model <name>) is per docs, unverified like
-      # the rest of this leg.
-      if [[ -n "$model" ]]; then
-        agy -p "$(cat "$prompt_file")" --model "$model"
-      else
-        agy -p "$(cat "$prompt_file")"
+      # Verified against real agy 1.3.0. Headless (-p) mode auto-denies
+      # every tool call — shell commands, file reads, file writes — and
+      # neither --mode plan nor --mode accept-edits changes that. A denied
+      # call doesn't fail the run: agy exits 0 with an empty response and
+      # a notice on stderr. So this leg is prompt-only: the reviewer gets
+      # everything inline and is told up front not to reach for tools.
+      # That auto-deny is also the read-only guarantee (codex's
+      # --sandbox read-only equivalent) — unless your agy settings.json
+      # adds permissions.allow rules, which would apply here too.
+      # Deliberately not --mode plan: it injects a /plan directive telling
+      # the model to write an implementation-plan artifact first, which a
+      # headless run can only have denied (verified by asking agy 1.3.0
+      # about its own system prompt with and without the flag).
+      if [[ "$mode" == "author" ]]; then
+        echo "agy can't run as author headlessly: agy -p auto-denies file writes (write_file) even with --mode accept-edits. Respond interactively instead, or use --with codex|claude." >&2
+        exit 1
       fi
-      [[ -n "$token_file" ]] && echo "unknown" > "$token_file"
+      command -v jq >/dev/null || { echo "agy leg needs jq to parse agy's JSON output" >&2; exit 1; }
+      # No stdin support (-p requires an argument; `-p -` takes "-" as the
+      # literal prompt), so the prompt goes in as one argv string. That's
+      # bounded by ARG_MAX (1MB on macOS, environment included); a prompt
+      # past it fails at exec with a non-zero exit, caught below.
+      local prompt out errf rc=0
+      prompt="IMPORTANT for this run: you have no tool access. Every shell command, file read, and file write will be automatically denied, and a denied tool call ends the run with no output at all. Everything you need — task, full diff, and findings ledger — is included below. Do not try to read files or run commands; review from this text only.
+
+$(cat "$prompt_file")"
+      out="$(mktemp)"
+      errf="$(mktemp)"
+      # --print= with the value attached: agy's flag parser otherwise takes
+      # whatever argument follows -p as the prompt, so a misplaced flag
+      # would silently become the prompt instead. If/else rather than an
+      # args array for the same bash 3.2 empty-array reason as the codex leg.
+      if [[ -n "$model" ]]; then
+        agy --print-timeout "${CROSS_REVIEW_AGY_TIMEOUT:-900s}" --output-format json --model "$model" --print="$prompt" > "$out" 2> "$errf" || rc=$?
+      else
+        agy --print-timeout "${CROSS_REVIEW_AGY_TIMEOUT:-900s}" --output-format json --print="$prompt" > "$out" 2> "$errf" || rc=$?
+      fi
+      # agy exits 0 for several runs that produced nothing usable, so the
+      # exit code alone can't be trusted. Observed failure shapes:
+      #   - non-zero exit (e.g. account eligibility/licensing errors)
+      #   - status other than SUCCESS
+      #   - empty response + denied_actions (reviewer tried a tool anyway)
+      #   - empty response + total_tokens 0 ("run ended with no output and
+      #     no recorded error" — seen with pathological inputs)
+      #   - --print-timeout hit: still exit 0 + SUCCESS, with only a stderr
+      #     line ("[agy] print timeout after <n> with turn in progress;
+      #     returning partial output") to say so — and that partial output
+      #     can be non-empty, i.e. truncated findings that look complete
+      # So any blank response is treated as a failure, whatever else the
+      # JSON says. That's safe because agy won't send a truly empty reply
+      # even when asked to, so a genuine no-findings round still has text.
+      # The timeout check matches agy 1.3.0's stderr wording — a scrape,
+      # not a contract, like codex's token parsing.
+      local timed_out=""
+      grep -q 'print timeout after' "$errf" 2>/dev/null && timed_out="yes"
+      local status="" response="" denied="" total=0
+      if (( rc == 0 )); then
+        status="$(jq -r '.status // empty' "$out" 2>/dev/null || true)"
+        response="$(jq -r '.response // empty' "$out" 2>/dev/null || true)"
+        denied="$(jq -r '[.denied_actions[]?.action] | join(",")' "$out" 2>/dev/null || true)"
+        total="$(jq -r '.usage.total_tokens // 0' "$out" 2>/dev/null || echo 0)"
+      fi
+      if (( rc != 0 )) || [[ -n "$timed_out" ]] || [[ "$status" != "SUCCESS" ]] || [[ -z "${response//[[:space:]]/}" ]]; then
+        echo "agy failed (exit $rc, status ${status:-none}, denied: ${denied:-none}, tokens: ${total:-0}${timed_out:+, timed out — raise CROSS_REVIEW_AGY_TIMEOUT}):" >&2
+        cat "$errf" >&2
+        cat "$out" >&2
+        rm -f "$out" "$errf"
+        exit 1
+      fi
+      if [[ -n "$denied" ]]; then
+        echo "Note: agy attempted tool calls that were denied ($denied); its response was still recorded." >&2
+      fi
+      printf '%s\n' "$response"
+      [[ -n "$token_file" ]] && echo "$total" > "$token_file"
+      rm -f "$out" "$errf"
       ;;
     claude)
       # If this hangs for minutes with no output, it's almost certainly
@@ -310,11 +371,27 @@ run_tool() {
       # terminal, same as the rest of the claude leg was).
       local perm="plan"
       [[ "$mode" == "author" ]] && perm="acceptEdits"
+      # Captured and exit-checked explicitly: run_tool runs inside $(...),
+      # and bash 3.2 doesn't carry set -e into command substitutions, so a
+      # failed claude call would otherwise fall through to the next line
+      # and get recorded as an empty-findings round.
+      local out errf rc=0
+      out="$(mktemp)"
+      errf="$(mktemp)"
       if [[ -n "$model" ]]; then
-        claude -p --permission-mode "$perm" --output-format text --model "$model" < "$prompt_file"
+        claude -p --permission-mode "$perm" --output-format text --model "$model" < "$prompt_file" > "$out" 2> "$errf" || rc=$?
       else
-        claude -p --permission-mode "$perm" --output-format text < "$prompt_file"
+        claude -p --permission-mode "$perm" --output-format text < "$prompt_file" > "$out" 2> "$errf" || rc=$?
       fi
+      if (( rc != 0 )); then
+        echo "claude -p failed (exit $rc):" >&2
+        cat "$errf" "$out" >&2
+        rm -f "$out" "$errf"
+        exit 1
+      fi
+      cat "$errf" >&2
+      cat "$out"
+      rm -f "$out" "$errf"
       [[ -n "$token_file" ]] && echo "unknown" > "$token_file"
       ;;
     *)
@@ -468,7 +545,7 @@ cmd_respond() {
       *) echo "Unknown arg: $1" >&2; exit 1 ;;
     esac
   done
-  [[ -n "$tool" ]] || { echo "--with codex|agy|claude is required" >&2; exit 1; }
+  [[ -n "$tool" ]] || { echo "--with codex|claude is required" >&2; exit 1; }
 
   acquire_lock "$dir"
 
