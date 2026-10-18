@@ -57,16 +57,21 @@ $EDITOR .cross-review/*-auth-rework/task.md # describe the goal/spec
 `review`/`respond` also take `--model <name>` to pin a specific model —
 see "Same vendor vs. cross-vendor" below. An invalid model name or a
 failed reviewer call fails loudly (exit 1) rather than silently
-producing an empty review.
+producing an empty review. So does a reply that ignores the output
+format — no `## F<n>` entries and no "No new findings" line: it's saved
+to `round-N-rejected.md` in the session dir instead of the ledger.
 
 The frozen diff (including untracked, non-gitignored files) goes to
 another vendor's model verbatim, so files that look like secrets —
 `.env*`, private keys, `.netrc`/`.npmrc`, `credentials.json`, etc. —
 are replaced with a stub and a warning instead (templates like
-`.env.example` pass through). Extend the list with
-`CROSS_REVIEW_EXTRA_SENSITIVE="*.tfvars prod-*.yaml"`. It's a filename
-check, not a content scan — secrets pasted into ordinary source files
-still go through.
+`.env.example` pass through). A file renamed away from a sensitive name
+(`git mv .env .env.example`), or an exact copy of any sensitive file —
+tracked, untracked, or gitignored (`cp .env backup.txt`), including a
+committed copy being deleted or edited — is stubbed too. Extend the list with
+`CROSS_REVIEW_EXTRA_SENSITIVE="*.tfvars prod-*.yaml"`. It's not a
+content scan: secrets pasted into ordinary source files, or an edited
+copy of a sensitive file, still go through.
 
 ## Same vendor vs. cross-vendor
 
@@ -135,6 +140,10 @@ Tokens: 4672 across 2 round(s)
 Open (awaiting author response):
   F4 [major] Unhandled exception on empty input — src/api.py:80
 ```
+
+A finding the author answered but deliberately left `open` — e.g. a
+major/critical security finding, which the author prompt says not to
+dismiss without you — is listed separately under "needs human sign-off".
 
 ## Status per tool
 

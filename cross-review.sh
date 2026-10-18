@@ -37,9 +37,10 @@ CROSS_REVIEW_MAX_TOTAL_DIFF_BYTES="${CROSS_REVIEW_MAX_TOTAL_DIFF_BYTES:-800000}"
 # diff.patch -- that file goes verbatim into a third-party reviewer's prompt, and untracked
 # files are included as long as they aren't gitignored, so an un-ignored .env or private key
 # would otherwise be shipped to another vendor. Matched case-sensitively against the basename
-# only. Templates (.env.example etc.) are allowed through by is_sensitive_path. Add your own
+# only. Templates (.env.example etc.) and public keys (*.pub) are allowed through by
+# is_sensitive_path. Add your own
 # with CROSS_REVIEW_EXTRA_SENSITIVE (space-separated globs, e.g. "*.tfvars prod-*.yaml").
-CROSS_REVIEW_SENSITIVE_PATTERNS='.env .env.* *.pem *.key *.p12 *.pfx *.jks *.keystore id_rsa id_rsa.* id_dsa id_dsa.* id_ecdsa id_ecdsa.* id_ed25519 id_ed25519.* .netrc .npmrc .pypirc .pgpass credentials credentials.json *.credentials.json service-account*.json secrets.* *.secret *.secrets'
+CROSS_REVIEW_SENSITIVE_PATTERNS='.env .env.* *.env *.pem *.key *.p12 *.pfx *.jks *.keystore id_rsa id_rsa.* id_dsa id_dsa.* id_ecdsa id_ecdsa.* id_ed25519 id_ed25519.* .netrc .npmrc .pypirc .pgpass credentials credentials.json *.credentials.json service-account*.json secrets.* *.secret *.secrets'
 
 usage() {
   cat <<'EOF'
@@ -174,7 +175,7 @@ is_sensitive_path() {
   local name pat
   name="$(basename "$1")"
   case "$name" in
-    *.example|*.sample|*.template|*.dist) return 1 ;;
+    *.example|*.sample|*.template|*.dist|*.pub) return 1 ;;
   esac
   # Unquoted $pat in the case pattern so it's matched as a glob; set -f keeps the unquoted
   # word list from being expanded against the cwd while it's split.
@@ -188,11 +189,60 @@ is_sensitive_path() {
   return 1
 }
 
+# Prints "<blob-hash> <path>" for every non-empty sensitive-named file in the working tree --
+# tracked, untracked, *and* gitignored (a gitignored .env is the usual source of a
+# `cp .env somewhere-innocuous`). freeze_diff compares each changed file's hash against these
+# to catch exact copies under a non-sensitive name, which no filename check or rename detection
+# can see. Listing is done by git with glob pathspecs built from the same patterns, so the walk
+# stays in C instead of a bash loop over every file in the repo; is_sensitive_path then drops
+# templates. Only exact copies are caught -- an edited or partial copy still goes through.
+sensitive_content_hashes() {
+  local pat f
+  local specs=()
+  set -f
+  for pat in $CROSS_REVIEW_SENSITIVE_PATTERNS ${CROSS_REVIEW_EXTRA_SENSITIVE:-}; do
+    specs+=(":(glob)**/$pat")
+  done
+  set +f
+  # -o without --exclude-standard includes ignored files, deliberately.
+  git ls-files -c -o -z -- "${specs[@]}" | while IFS= read -r -d '' f; do
+    [[ -f "$f" && -s "$f" ]] || continue
+    is_sensitive_path "$f" || continue
+    printf '%s %s\n' "$(git hash-object -- "$f")" "$f"
+  done
+}
+
+# If blob hash $1 appears in $2 (sensitive_content_hashes output), print the matching file's
+# path and return 0.
+sensitive_hash_source() {
+  local h="$1" hashes="$2"
+  [[ -n "$h" && -n "$hashes" ]] || return 1
+  printf '%s\n' "$hashes" | awk -v h="$h" '$1 == h { sub(/^[^ ]+ /, ""); print; found = 1; exit } END { exit !found }'
+}
+
+# If working-tree file $1 is byte-identical to a sensitive file, print that file's path.
+sensitive_copy_source() {
+  local f="$1" hashes="$2"
+  [[ -n "$hashes" && -f "$f" && -s "$f" ]] || return 1
+  sensitive_hash_source "$(git hash-object -- "$f")" "$hashes"
+}
+
+# Same, for the version of $2 at commit $1 -- a modified or deleted file's diff prints its old
+# content as `-` lines, so a committed copy of a secret leaks on deletion even though nothing
+# is left on disk to hash. Uses the blob id git already has; no-op if $2 didn't exist at $1.
+sensitive_base_source() {
+  local base="$1" f="$2" hashes="$3" h
+  [[ -n "$hashes" ]] || return 1
+  h="$(git rev-parse -q --verify "$base:$f" 2>/dev/null)" || return 1
+  sensitive_hash_source "$h" "$hashes"
+}
+
 # Stub written in place of a sensitive file's diff -- still a real `diff --git` header so the
-# reviewer can see the file changed, just not its content.
+# reviewer can see the file changed, just not its content. detail, if given, says why a file
+# with an innocuous name was stubbed (e.g. "renamed from .env").
 emit_sensitive_stub() {
-  local path="$1"
-  echo "Warning: $path matches a sensitive-file pattern; its content was left out of diff.patch (not sent to the reviewer)." >&2
+  local path="$1" detail="${2:-}"
+  echo "Warning: $path${detail:+ ($detail)} matches a sensitive-file pattern; its content was left out of diff.patch (not sent to the reviewer)." >&2
   echo "diff --git a/$path b/$path"
   echo "@@ cross-review: diff omitted -- filename matches a sensitive-file pattern (credentials/keys/env), so its content was not sent to the reviewer. Add CROSS_REVIEW_EXTRA_SENSITIVE globs to extend the list. @@"
 }
@@ -223,9 +273,42 @@ freeze_diff() {
     # One file at a time (not a single whole-tree `git diff "$base"`), so emit_file_diff can cap
     # each file independently — an oversized file no longer takes the rest of a perfectly
     # reviewable diff down with it (see emit_file_diff's own header for the real-world trigger).
-    local f tmp
-    git diff --name-only "$base" -z | while IFS= read -r -d '' f; do
+    #
+    # --name-status -M (not --name-only) so a rename's *source* path is visible too: `git mv .env
+    # data.txt` or `git mv .env .env.example` lists only the innocuous new name otherwise, and
+    # the per-path diff below then shows the old secret content as a brand-new file. -M is
+    # explicit so this holds even with diff.renames=false in the user's config. With -z, each
+    # entry is "<status>\0<path>\0", or "R<score>\0<src>\0<dst>\0" for renames. Copies aren't
+    # detected here (-C only considers modified files as sources; --find-copies-harder costs a
+    # scan of every tracked file per round) -- the content-hash check below covers those.
+    local f tmp st src copied_from sens_hashes
+    sens_hashes="$(sensitive_content_hashes)"
+    git diff --name-status -M -z "$base" | while IFS= read -r -d '' st; do
+      src=""
+      case "$st" in
+        R*|C*) IFS= read -r -d '' src; IFS= read -r -d '' f ;;
+        *) IFS= read -r -d '' f ;;
+      esac
       if is_sensitive_path "$f"; then emit_sensitive_stub "$f"; continue; fi
+      if [[ -n "$src" ]] && is_sensitive_path "$src"; then
+        emit_sensitive_stub "$f" "renamed from $src"
+        continue
+      fi
+      if copied_from="$(sensitive_copy_source "$f" "$sens_hashes")"; then
+        emit_sensitive_stub "$f" "same content as $copied_from"
+        continue
+      fi
+      # Old side only exists for non-added, non-renamed entries (a rename's per-path diff below
+      # shows only the new content).
+      case "$st" in
+        A*|R*|C*) ;;
+        *)
+          if copied_from="$(sensitive_base_source "$base" "$f" "$sens_hashes")"; then
+            emit_sensitive_stub "$f" "previous version had the same content as $copied_from"
+            continue
+          fi
+          ;;
+      esac
       tmp="$(mktemp)"
       git diff "$base" -- "$f" > "$tmp"
       emit_file_diff "$tmp" "$f"
@@ -250,6 +333,10 @@ freeze_diff() {
         "$abs_sessions_root"/*) continue ;;
       esac
       if is_sensitive_path "$f"; then emit_sensitive_stub "$f"; continue; fi
+      if copied_from="$(sensitive_copy_source "$f" "$sens_hashes")"; then
+        emit_sensitive_stub "$f" "same content as $copied_from"
+        continue
+      fi
       tmp="$(mktemp)"
       git diff --no-index -- /dev/null "$f" > "$tmp" || true
       emit_file_diff "$tmp" "$f"
@@ -563,6 +650,18 @@ cmd_review() {
   tokens="$(cat "$token_file")"
   rm -f "$prompt_file" "$token_file"
 
+  # A reviewer that ignores the output format (e.g. replies with a prose summary of what it
+  # "reported") would otherwise be recorded as a round with no findings -- `status` then shows
+  # nothing open while a real finding exists only as prose. Require at least one `## F<n>` entry
+  # or the explicit no-findings line; otherwise keep the raw reply next to the ledger, but out
+  # of it, and fail.
+  if ! printf '%s\n' "$output" | grep -qE '^(## F[0-9]+ |No new findings)'; then
+    local rejected="$dir/round-$round-rejected.md"
+    printf '%s\n' "$output" > "$rejected"
+    echo "Reviewer output for round $round has no '## F<n>' findings and no 'No new findings' line, so it wasn't appended to findings.md. Raw output saved to $rejected -- re-run the review, or transcribe any findings by hand." >&2
+    exit 1
+  fi
+
   {
     echo
     echo "## Round $round — reviewer:$tool${model:+ ($model)} — $(date -u +%FT%TZ) — tokens: $tokens"
@@ -637,17 +736,20 @@ cmd_respond() {
 }
 
 # Parses findings.md into one tab-separated row per finding:
-#   id \t final_status \t severity \t file \t summary
+#   id \t final_status \t severity \t file \t summary \t responded
 # "final_status" is whichever Status: line occurs LAST inside that
 # finding's block, so a finding that started open and later got a
 # "### Response (author)" with Status: fixed is counted once, as fixed —
 # not once for each line (a naive grep -c per status double-counts these).
+# "responded" is 1 if the finding has any "### Response (author)" block, so
+# a finding the author deliberately left open (e.g. a security call that
+# needs human sign-off) can be told apart from one nobody has answered.
 parse_findings() {
   local findings="$1"
   awk '
     function emit() {
       if (fid != "") {
-        printf "%s\t%s\t%s\t%s\t%s\n", fid, status, severity, file, summary
+        printf "%s\t%s\t%s\t%s\t%s\t%d\n", fid, status, severity, file, summary, responded
       }
     }
     /^## F[0-9]+/ {
@@ -670,6 +772,11 @@ parse_findings() {
       status = ""
       severity = ""
       file = ""
+      responded = 0
+      next
+    }
+    fid != "" && /^### Response \(author\)/ {
+      responded = 1
       next
     }
     fid != "" && /^Reviewer:/ {
@@ -755,11 +862,19 @@ cmd_status() {
   fi
 
   local open_rows
-  open_rows="$(echo "$rows" | awk -F'\t' '$2=="open"')"
+  open_rows="$(echo "$rows" | awk -F'\t' '$2=="open" && $6!="1"')"
   if [[ -n "$open_rows" ]]; then
     echo
     echo "Open (awaiting author response):"
     echo "$open_rows" | awk -F'\t' '{printf "  %s [%s] %s — %s\n", $1, $3, $5, $4}'
+  fi
+
+  local signoff_rows
+  signoff_rows="$(echo "$rows" | awk -F'\t' '$2=="open" && $6=="1"')"
+  if [[ -n "$signoff_rows" ]]; then
+    echo
+    echo "Open — needs human sign-off (author responded but left it open):"
+    echo "$signoff_rows" | awk -F'\t' '{printf "  %s [%s] %s — %s\n", $1, $3, $5, $4}'
   fi
 
   local disputed_rows
