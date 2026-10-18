@@ -59,6 +59,15 @@ see "Same vendor vs. cross-vendor" below. An invalid model name or a
 failed reviewer call fails loudly (exit 1) rather than silently
 producing an empty review.
 
+The frozen diff (including untracked, non-gitignored files) goes to
+another vendor's model verbatim, so files that look like secrets —
+`.env*`, private keys, `.netrc`/`.npmrc`, `credentials.json`, etc. —
+are replaced with a stub and a warning instead (templates like
+`.env.example` pass through). Extend the list with
+`CROSS_REVIEW_EXTRA_SENSITIVE="*.tfvars prod-*.yaml"`. It's a filename
+check, not a content scan — secrets pasted into ordinary source files
+still go through.
+
 ## Same vendor vs. cross-vendor
 
 Every reviewer invocation is a fresh process with a self-contained

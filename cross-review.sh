@@ -33,6 +33,13 @@ CROSS_REVIEW_MAX_FILE_DIFF_BYTES="${CROSS_REVIEW_MAX_FILE_DIFF_BYTES:-200000}"
 # change), so it errs toward letting a legitimately large diff through with a heads-up rather
 # than blocking one that would have worked.
 CROSS_REVIEW_MAX_TOTAL_DIFF_BYTES="${CROSS_REVIEW_MAX_TOTAL_DIFF_BYTES:-800000}"
+# Basename globs for files whose content is replaced with a stub instead of being frozen into
+# diff.patch -- that file goes verbatim into a third-party reviewer's prompt, and untracked
+# files are included as long as they aren't gitignored, so an un-ignored .env or private key
+# would otherwise be shipped to another vendor. Matched case-sensitively against the basename
+# only. Templates (.env.example etc.) are allowed through by is_sensitive_path. Add your own
+# with CROSS_REVIEW_EXTRA_SENSITIVE (space-separated globs, e.g. "*.tfvars prod-*.yaml").
+CROSS_REVIEW_SENSITIVE_PATTERNS='.env .env.* *.pem *.key *.p12 *.pfx *.jks *.keystore id_rsa id_rsa.* id_dsa id_dsa.* id_ecdsa id_ecdsa.* id_ed25519 id_ed25519.* .netrc .npmrc .pypirc .pgpass credentials credentials.json *.credentials.json service-account*.json secrets.* *.secret *.secrets'
 
 usage() {
   cat <<'EOF'
@@ -60,6 +67,8 @@ Usage:
 Env:
   CROSS_REVIEW_HOME         override the sessions root (default: .cross-review)
   CROSS_REVIEW_AGY_TIMEOUT  agy --print-timeout per review (default: 900s)
+  CROSS_REVIEW_EXTRA_SENSITIVE  extra space-separated basename globs whose
+                            content is kept out of the diff sent to reviewers
 EOF
 }
 
@@ -160,6 +169,34 @@ emit_file_diff() {
   fi
 }
 
+# True if $1's basename matches a sensitive-file glob (see CROSS_REVIEW_SENSITIVE_PATTERNS).
+is_sensitive_path() {
+  local name pat
+  name="$(basename "$1")"
+  case "$name" in
+    *.example|*.sample|*.template|*.dist) return 1 ;;
+  esac
+  # Unquoted $pat in the case pattern so it's matched as a glob; set -f keeps the unquoted
+  # word list from being expanded against the cwd while it's split.
+  set -f
+  for pat in $CROSS_REVIEW_SENSITIVE_PATTERNS ${CROSS_REVIEW_EXTRA_SENSITIVE:-}; do
+    case "$name" in
+      $pat) set +f; return 0 ;;
+    esac
+  done
+  set +f
+  return 1
+}
+
+# Stub written in place of a sensitive file's diff -- still a real `diff --git` header so the
+# reviewer can see the file changed, just not its content.
+emit_sensitive_stub() {
+  local path="$1"
+  echo "Warning: $path matches a sensitive-file pattern; its content was left out of diff.patch (not sent to the reviewer)." >&2
+  echo "diff --git a/$path b/$path"
+  echo "@@ cross-review: diff omitted -- filename matches a sensitive-file pattern (credentials/keys/env), so its content was not sent to the reviewer. Add CROSS_REVIEW_EXTRA_SENSITIVE globs to extend the list. @@"
+}
+
 freeze_diff() {
   local dir="$1" base="${2:-HEAD}"
   local abs_dir abs_sessions_root
@@ -188,6 +225,7 @@ freeze_diff() {
     # reviewable diff down with it (see emit_file_diff's own header for the real-world trigger).
     local f tmp
     git diff --name-only "$base" -z | while IFS= read -r -d '' f; do
+      if is_sensitive_path "$f"; then emit_sensitive_stub "$f"; continue; fi
       tmp="$(mktemp)"
       git diff "$base" -- "$f" > "$tmp"
       emit_file_diff "$tmp" "$f"
@@ -211,6 +249,7 @@ freeze_diff() {
       case "$(cd -P "$(dirname "$f")" && pwd -P)/$(basename "$f")" in
         "$abs_sessions_root"/*) continue ;;
       esac
+      if is_sensitive_path "$f"; then emit_sensitive_stub "$f"; continue; fi
       tmp="$(mktemp)"
       git diff --no-index -- /dev/null "$f" > "$tmp" || true
       emit_file_diff "$tmp" "$f"
