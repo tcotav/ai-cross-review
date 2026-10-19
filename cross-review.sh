@@ -70,6 +70,9 @@ Env:
   CROSS_REVIEW_AGY_TIMEOUT  agy --print-timeout per review (default: 900s)
   CROSS_REVIEW_EXTRA_SENSITIVE  extra space-separated basename globs whose
                             content is kept out of the diff sent to reviewers
+  CROSS_REVIEW_AGY_ALLOW_RULES_OK=1
+                            run agy even if its settings have
+                            permissions.allow rules (refused by default)
 EOF
 }
 
@@ -105,6 +108,33 @@ CROSS_REVIEW_LOCKFILE=""
 
 release_lock() {
   [[ -n "$CROSS_REVIEW_LOCKFILE" ]] && rm -f -- "$CROSS_REVIEW_LOCKFILE" 2>/dev/null
+  return 0
+}
+
+# The agy leg's scratch dir (and its out/err temp files), removed by an
+# EXIT trap so an interrupted review (Ctrl-C, SIGTERM, an error under
+# set -e) doesn't leave it behind — which matters most in the allow-rules
+# override case, where the reviewer may have written into it. Same
+# named-function-not-interpolated-string reasoning as release_lock.
+CROSS_REVIEW_AGY_SCRATCH=""
+CROSS_REVIEW_AGY_OUT=""
+CROSS_REVIEW_AGY_ERR=""
+CROSS_REVIEW_AGY_TRAP_SUBSHELL=""
+
+cleanup_agy_tmp() {
+  local p
+  for p in "$CROSS_REVIEW_AGY_SCRATCH" "$CROSS_REVIEW_AGY_OUT" "$CROSS_REVIEW_AGY_ERR"; do
+    [[ -n "$p" ]] && rm -rf -- "$p" 2>/dev/null
+  done
+  CROSS_REVIEW_AGY_SCRATCH="" CROSS_REVIEW_AGY_OUT="" CROSS_REVIEW_AGY_ERR=""
+  # run_tool normally runs inside cmd_review's $(...) subshell, where this
+  # trap replaces nothing — but the parent still holds the lock there and
+  # is about to write findings.md, so only release it when this trap is
+  # standing in for release_lock in the main shell. Uses the value saved
+  # when the trap was installed, NOT $BASH_SUBSHELL here: bash 3.2 reports
+  # 0 inside a $(...) child's EXIT trap even though the body saw 1
+  # (verified), which would release the parent's lock early.
+  [[ "$CROSS_REVIEW_AGY_TRAP_SUBSHELL" == "0" ]] && release_lock
   return 0
 }
 
@@ -425,25 +455,126 @@ run_tool() {
         exit 1
       fi
       command -v jq >/dev/null || { echo "agy leg needs jq to parse agy's JSON output" >&2; exit 1; }
+      # The auto-deny above is the only thing keeping review read-only, and
+      # allow-grants switch it off for whatever they match — headless runs
+      # included (--dangerously-skip-permissions doesn't; it's ignored under
+      # -p). So refuse when any local file agy takes grants from has one,
+      # rather than trust the prompt to keep an allowed tool unused. Sources
+      # found in the agy 1.3.0 binary: permissions.allow in the user and
+      # admin settings files, globalPermissionGrants in the shared
+      # ~/.gemini/config/config.json, and per-project grants in the project
+      # records under ~/.gemini/config/projects/ (ApplyProjectPermissionGrants).
+      # The check covers only the grant containers confirmed there, by exact
+      # key: top-level `permissions` (named in agy's own denial message),
+      # and `globalPermissionGrants` / `permissionGrants` at any depth
+      # (protobuf JSON names in the binary; the "%d allow, %d deny grants"
+      # log line confirms their allow/deny shape). Each one present must be
+      # an object (or null) whose `allow` is absent or an empty array.
+      # Deliberately exact-key, not a "permission" substring match: agy also
+      # writes harmless flags like permissionGrantsV2Migrated: true, and
+      # refusing on those broke migrated configs. Other permission-like
+      # fields (allowedTools, allowlist, ...) aren't checked, since nothing
+      # shows they grant headless tool use — and server-side grants
+      # (AddPermissionGrants, GetUserAccountSettings RPCs) are invisible
+      # here regardless. So this is best effort; the read-only guarantee
+      # rests on the headless auto-deny and the prompt-only design.
+      # Repo-level config never applies: agy runs from an empty scratch dir
+      # (below). CROSS_REVIEW_AGY_ALLOW_RULES_OK=1 overrides, for grants
+      # you've checked can't write (e.g. read-only commands).
+      # Exactly "1", not just non-empty — "0"/"false" must not switch the
+      # check off.
+      if [[ "${CROSS_REVIEW_AGY_ALLOW_RULES_OK:-}" != "1" ]]; then
+        local sf
+        for sf in "$HOME/.gemini/antigravity-cli/settings.json" \
+                  "$HOME/.gemini/config/config.json" \
+                  "/Library/Application Support/Antigravity/admin_settings.json" \
+                  "/etc/antigravity/admin_settings.json" \
+                  "$HOME"/.gemini/config/projects/*.json; do
+          # Skips missing files, and the literal pattern bash leaves behind
+          # when the projects glob matches nothing.
+          [[ -e "$sf" ]] || continue
+          # One slurped (-s) jq call decides everything, failing closed:
+          #   - empty / whitespace-only file: slurps to [] -> passes (agy
+          #     ships an empty mcp_config.json the same way)
+          #   - unreadable, invalid JSON, or several top-level values (jq -e
+          #     alone only looks at the last one): fails -> refuse
+          #   - shape asserted rather than grants tested for: a positive
+          #     "has grants" test fails open on a jq type error (e.g.
+          #     "allow": true exits 5, which `if` reads as "no grants")
+          if ! jq -se 'length <= 1
+                       and ((.[0] // {}) | type == "object"
+                            and ([.permissions, (.. | objects | .globalPermissionGrants?, .permissionGrants?)]
+                                 | map(select(. != null))
+                                 | all(type == "object"
+                                       and ((.allow // []) | type == "array" and length == 0))))' "$sf" >/dev/null 2>&1; then
+            echo "Refusing to run agy as reviewer: $sf has permission allow-grants, or couldn't be read or parsed to check (grants apply to headless agy too and would let the reviewer use those tools against your machine). Remove them, or set CROSS_REVIEW_AGY_ALLOW_RULES_OK=1 if you've confirmed none of them can write." >&2
+            exit 1
+          fi
+        done
+      fi
       # No stdin support (-p requires an argument; `-p -` takes "-" as the
       # literal prompt), so the prompt goes in as one argv string. That's
       # bounded by ARG_MAX (1MB on macOS, environment included); a prompt
       # past it fails at exec with a non-zero exit, caught below.
-      local prompt out errf rc=0
+      local prompt out errf scratch rc=0
       prompt="IMPORTANT for this run: you have no tool access. Every shell command, file read, and file write will be automatically denied, and a denied tool call ends the run with no output at all. Everything you need — task, full diff, and findings ledger — is included below. Do not try to read files or run commands; review from this text only.
 
 $(cat "$prompt_file")"
       out="$(mktemp)"
       errf="$(mktemp)"
+      CROSS_REVIEW_AGY_OUT="$out"
+      CROSS_REVIEW_AGY_ERR="$errf"
+      CROSS_REVIEW_AGY_TRAP_SUBSHELL="$BASH_SUBSHELL"
+      trap cleanup_agy_tmp EXIT
+      # Run from an empty scratch dir, not the repo under review. The leg is
+      # prompt-only, so agy never needs the repo as its workspace — and
+      # launching it there would hand agy that repo's own project config
+      # (.agents/hooks.json, .agents/skills, workflows, GEMINI.md/AGENTS.md
+      # rules), which a diff under review could have added or changed. It
+      # also means a tool call that slips through via permissions.allow
+      # rules lands relative paths in throwaway space instead of the repo
+      # (absolute paths still could reach it — see the refusal check above).
+      scratch="$(mktemp -d)"
+      CROSS_REVIEW_AGY_SCRATCH="$scratch"
+      # mktemp honours TMPDIR, which could point inside the repo — then the
+      # "empty" dir would sit under the repo after all, and agy could pick
+      # up the repo's config from an ancestor dir. Fail closed. cmd_review
+      # has already cd'd to the repo root, so $(pwd -P) is it.
+      local abs_scratch repo_abs
+      abs_scratch="$(cd -P "$scratch" && pwd -P)"
+      repo_abs="$(pwd -P)"
+      case "$abs_scratch/" in
+        "$repo_abs"/*)
+          echo "Refusing to run agy: its scratch dir ($abs_scratch) is inside the repo under review ($repo_abs) — point TMPDIR outside the repo." >&2
+          rm -rf "$scratch" "$out" "$errf"
+          exit 1
+          ;;
+      esac
       # --print= with the value attached: agy's flag parser otherwise takes
       # whatever argument follows -p as the prompt, so a misplaced flag
       # would silently become the prompt instead. If/else rather than an
       # args array for the same bash 3.2 empty-array reason as the codex leg.
+      #
+      # --sandbox ("terminal restrictions", per agy --help) is an extra,
+      # UNVERIFIED layer for the override case: whether it actually blocks
+      # writes couldn't be tested, because nothing short of a real
+      # permissions.allow rule lets headless agy use a tool at all —
+      # --dangerously-skip-permissions is ignored under -p (verified: a
+      # shell write was still auto-denied with it, with and without
+      # --sandbox). It's confirmed harmless for a normal run. Don't count it
+      # as the read-only guarantee; the auto-deny plus the refusal check
+      # above is that.
+      #
+      # cd -P into the resolved path that was just checked, not $scratch: a
+      # logical cd through a symlinked TMPDIR inside the repo would leave
+      # $PWD pointing into the repo, which agy (Go's os.Getwd honours a
+      # matching $PWD) could then use for ancestor config discovery.
       if [[ -n "$model" ]]; then
-        agy --print-timeout "${CROSS_REVIEW_AGY_TIMEOUT:-900s}" --output-format json --model "$model" --print="$prompt" > "$out" 2> "$errf" || rc=$?
+        ( cd -P "$abs_scratch" && agy --sandbox --print-timeout "${CROSS_REVIEW_AGY_TIMEOUT:-900s}" --output-format json --model "$model" --print="$prompt" ) > "$out" 2> "$errf" || rc=$?
       else
-        agy --print-timeout "${CROSS_REVIEW_AGY_TIMEOUT:-900s}" --output-format json --print="$prompt" > "$out" 2> "$errf" || rc=$?
+        ( cd -P "$abs_scratch" && agy --sandbox --print-timeout "${CROSS_REVIEW_AGY_TIMEOUT:-900s}" --output-format json --print="$prompt" ) > "$out" 2> "$errf" || rc=$?
       fi
+      rm -rf "$scratch"
       # agy exits 0 for several runs that produced nothing usable, so the
       # exit code alone can't be trusted. Observed failure shapes:
       #   - non-zero exit (e.g. account eligibility/licensing errors)

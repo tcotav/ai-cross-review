@@ -158,9 +158,20 @@ dismiss without you — is listed separately under "needs human sign-off".
 - **`agy`** — verified against agy 1.3.0, review only. Headless `agy -p`
   auto-denies every tool call (commands, file reads, writes), so the
   reviewer works purely from the inline prompt — that auto-deny is also
-  the no-write guarantee, unless your agy `settings.json` adds
-  `permissions.allow` rules. `respond --with agy` is refused for the same
-  reason. Token usage works. If `agy -p` fails with "Eligibility check
+  the no-write guarantee. Because allow-grants would switch it off, the
+  harness refuses to run agy if any local file agy takes grants from has
+  one: `permissions.allow` in your user or admin settings,
+  `globalPermissionGrants` in `~/.gemini/config/config.json`, or grants in
+  a project record under `~/.gemini/config/projects/` (override with
+  `CROSS_REVIEW_AGY_ALLOW_RULES_OK=1` once you've confirmed they can't
+  write). This is best effort: it checks only those confirmed grant
+  fields, and agy can also hold grants server-side, which the harness
+  can't see. It also runs agy from an empty temp directory so
+  the reviewed repo's own `.agents/` config and rules files never apply.
+  (`--dangerously-skip-permissions` is ignored under `-p`, so grants are
+  the only way to give headless agy tools. agy also runs with `--sandbox`
+  as an extra layer, but whether that blocks writes is unverified.) `respond --with agy` is refused, since headless
+  agy can't write. Token usage works. If `agy -p` fails with "Eligibility check
   failed" on a work account, set `gcp.project` (and `gcp.location`) in
   `~/.gemini/antigravity-cli/settings.json` so it uses the enterprise
   license instead of the consumer one. Per-review timeout is
