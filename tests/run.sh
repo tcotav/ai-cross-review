@@ -494,6 +494,49 @@ test_review_refreezes_diff() {
   assert_contains "$(cat "$STUB_DIR/codex.stdin")" "+after-init" "reviewer sees changes made after init"
 }
 
+# Regression: cmd_review/cmd_respond create a prompt file (the full diff) and a token file in
+# $TMPDIR; they used to be removed only after run_tool returned, so any reviewer failure left
+# them behind. Nothing of the script's own may survive any exit path.
+test_no_temp_leak_on_any_exit_path() {
+  start_session
+  echo "diff-content-marker" >> a.txt
+
+  export STUB_CODEX_RC=3 STUB_CODEX_OUT=/dev/null
+  cr review "$SESSION" --with codex
+  assert_rc 1 "codex failure"
+  assert_eq "" "$(ls -A "$T/tmp")" "no temp files after codex failure"
+
+  cr respond "$SESSION" --with codex
+  assert_rc 1 "codex author failure"
+  assert_eq "" "$(ls -A "$T/tmp")" "no temp files after codex respond failure"
+
+  export STUB_CLAUDE_RC=2 STUB_CLAUDE_OUT=/dev/null
+  cr review "$SESSION" --with claude
+  assert_rc 1 "claude failure"
+  assert_eq "" "$(ls -A "$T/tmp")" "no temp files after claude failure"
+
+  echo '{"status":"ERROR","response":"x","usage":{"total_tokens":1}}' > "$T/agy.json"
+  export STUB_AGY_JSON="$T/agy.json"
+  cr review "$SESSION" --with agy
+  assert_rc 1 "agy failure"
+  assert_eq "" "$(ls -A "$T/tmp")" "no temp files after agy failure"
+
+  echo "prose, no findings format" > "$T/findings.out"
+  unset STUB_CODEX_RC; export STUB_CODEX_OUT="$T/findings.out"
+  cr review "$SESSION" --with codex
+  assert_rc 1 "malformed output"
+  assert_eq "" "$(ls -A "$T/tmp")" "no temp files after rejected output"
+
+  cr review "$SESSION" --with bogus
+  assert_rc 1 "unknown tool"
+  assert_eq "" "$(ls -A "$T/tmp")" "no temp files after unknown tool"
+
+  good_findings; export STUB_CODEX_OUT="$T/findings.out"
+  cr review "$SESSION" --with codex
+  assert_rc 0 "success"
+  assert_eq "" "$(ls -A "$T/tmp")" "no temp files after success"
+}
+
 # ---------------------------------------------------------------- respond
 
 test_respond_codex_runs_author_role() {

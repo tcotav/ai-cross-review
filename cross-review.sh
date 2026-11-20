@@ -106,8 +106,18 @@ stored_repo_root() {
 # otherwise break out of the trap's quoting and inject shell commands.
 CROSS_REVIEW_LOCKFILE=""
 
+# The review/respond prompt and token temp files. The prompt file holds the whole frozen diff
+# and the ledger, so it must not outlive the run. They used to be removed only after run_tool
+# returned, which a reviewer failure (run_tool exits 1) skipped, leaving both in $TMPDIR.
+# Registering them here lets the same EXIT trap that releases the lock remove them on every
+# exit path: success, `exit 1` from run_tool, set -e, or a signal.
+CROSS_REVIEW_PROMPT_FILE=""
+CROSS_REVIEW_TOKEN_FILE=""
+
 release_lock() {
   [[ -n "$CROSS_REVIEW_LOCKFILE" ]] && rm -f -- "$CROSS_REVIEW_LOCKFILE" 2>/dev/null
+  [[ -n "$CROSS_REVIEW_PROMPT_FILE" ]] && rm -f -- "$CROSS_REVIEW_PROMPT_FILE" 2>/dev/null
+  [[ -n "$CROSS_REVIEW_TOKEN_FILE" ]] && rm -f -- "$CROSS_REVIEW_TOKEN_FILE" 2>/dev/null
   return 0
 }
 
@@ -755,6 +765,7 @@ cmd_review() {
 
   local prompt_file
   prompt_file="$(mktemp)"
+  CROSS_REVIEW_PROMPT_FILE="$prompt_file"
 
   {
     cat "$ROOT_DIR/prompts/review.md"
@@ -775,6 +786,7 @@ cmd_review() {
 
   local token_file
   token_file="$(mktemp)"
+  CROSS_REVIEW_TOKEN_FILE="$token_file"
   local output
   output="$(run_tool "$tool" review "$prompt_file" "$token_file" "$model")"
   local tokens
@@ -828,6 +840,7 @@ cmd_respond() {
 
   local prompt_file
   prompt_file="$(mktemp)"
+  CROSS_REVIEW_PROMPT_FILE="$prompt_file"
 
   {
     cat "$ROOT_DIR/prompts/respond.md"
@@ -855,6 +868,7 @@ cmd_respond() {
   # not as the recommended default.
   local token_file
   token_file="$(mktemp)"
+  CROSS_REVIEW_TOKEN_FILE="$token_file"
   run_tool "$tool" author "$prompt_file" "$token_file" "$model"
   local tokens
   tokens="$(cat "$token_file")"
