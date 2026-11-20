@@ -181,6 +181,15 @@ dismiss without you — is listed separately under "needs human sign-off".
   1MB on macOS) and growing with the ledger each round; past that the
   review fails loudly.
 
+## Tests
+
+```bash
+tests/run.sh           # whole suite
+tests/run.sh agy       # only tests whose name contains "agy"
+```
+
+Synthetic and offline: `codex`, `agy`, `claude`, `mktemp` and `date` are stubs on `PATH`, `HOME` is a throwaway directory, and each test runs in its own temp git repo, so no real reviewer, network or user config is touched. Needs only `bash`, `git` and `jq`, and runs under macOS's bash 3.2. The stubs check this harness's own behaviour (diff freezing, secret stubbing, ledger parsing, locking, the agy grant refusal); they say nothing about what the real CLIs do, so re-verify the "Status per tool" notes by hand after a CLI upgrade.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
